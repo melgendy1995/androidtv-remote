@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { desktopDir } from "@tauri-apps/api/path";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { AppInfo } from "../types";
 
@@ -160,7 +160,7 @@ export function AppDrawer({ open, onClose }: Props) {
       } catch {
         defaultPath = undefined;
       }
-      const selected = await open({
+      const selected = await openFileDialog({
         multiple: false,
         directory: false,
         defaultPath,
