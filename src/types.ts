@@ -65,6 +65,7 @@ export type LogLine = {
   level: LogLevel;
   tag: string;
   message: string;
+  raw?: string;
 };
 
 export type CrashEntry = {
@@ -74,6 +75,9 @@ export type CrashEntry = {
   process: string;
   reason: string;
   stack: string;
+  pid?: number;
+  exception?: string;
+  packageName?: string;
 };
 
 export type NetworkEntry = {

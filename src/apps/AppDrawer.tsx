@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { desktopDir } from "@tauri-apps/api/path";
+import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { AppInfo } from "../types";
 
@@ -54,7 +56,6 @@ export function AppDrawer({ open, onClose }: Props) {
   const [actionError, setActionError] = useState<string>();
   const [actionStatus, setActionStatus] = useState<string>();
   const [apkPath, setApkPath] = useState("");
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadApps = useCallback(async () => {
     setLoading(true);
@@ -149,6 +150,31 @@ export function AppDrawer({ open, onClose }: Props) {
     }
   };
 
+  const handleBrowseApk = async () => {
+    setActionError(undefined);
+    setActionStatus(undefined);
+    try {
+      let defaultPath: string | undefined;
+      try {
+        defaultPath = await desktopDir();
+      } catch {
+        defaultPath = undefined;
+      }
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        defaultPath,
+        title: "Select APK",
+        filters: [{ name: "Android package", extensions: ["apk"] }],
+      });
+      if (typeof selected === "string" && selected) {
+        setApkPath(selected);
+      }
+    } catch (e) {
+      setActionError(String(e));
+    }
+  };
+
   const handleInstallApk = async () => {
     if (!apkPath.trim()) return;
     setActionError(undefined);
@@ -230,25 +256,6 @@ export function AppDrawer({ open, onClose }: Props) {
           }}
         >
           <input
-            type="file"
-            ref={fileInputRef}
-            accept=".apk"
-            style={{ display: "none" }}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (!file) return;
-              const path = (file as File & { path?: string }).path;
-              if (path && (path.includes("/") || path.includes("\\"))) {
-                setApkPath(path);
-              } else {
-                setApkPath("");
-                setActionStatus(
-                  "Paste the full path to the APK. The file picker cannot see it on the desktop."
-                );
-              }
-            }}
-          />
-          <input
             type="text"
             placeholder="Selected APK path (or paste path)..."
             value={apkPath}
@@ -265,7 +272,7 @@ export function AppDrawer({ open, onClose }: Props) {
           />
           <button
             className="surface-btn"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={handleBrowseApk}
             style={{ width: "auto", padding: "8px 12px", fontSize: 12 }}
           >
             📂 Browse APK…

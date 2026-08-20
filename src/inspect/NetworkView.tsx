@@ -57,7 +57,7 @@ function JsonSyntaxViewer({ data }: { data: any }) {
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
         whiteSpace: "pre-wrap",
         wordBreak: "break-all",
-        maxHeight: 280,
+        maxHeight: 420,
         overflowY: "auto",
       }}
       dangerouslySetInnerHTML={{ __html: htmlContent }}
@@ -91,9 +91,35 @@ function getStatusBadge(status?: number, encrypted?: boolean) {
 function entryUrl(e: NetworkEntry) {
   if (e.url) return e.url;
   const scheme = e.encrypted ? "https" : "http";
-  const host = (e.host || "").replace(/:443$/, "");
-  const path = e.path?.startsWith("/") ? e.path : `/${e.path || ""}`;
-  return `${scheme}://${host}${path}`;
+  const host = (e.host || "").replace(/:443$/, "").replace(/:80$/, "");
+  const path = e.path || "";
+  if (!path) return `${scheme}://${host}`;
+  return `${scheme}://${host}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+function displayUrl(e: NetworkEntry) {
+  if ((e.method || "").toUpperCase() === "CONNECT") {
+    return `CONNECT ${e.host || entryUrl(e)}`;
+  }
+  return entryUrl(e);
+}
+
+function queryParams(url: string): [string, string][] {
+  try {
+    const parsed = new URL(url);
+    return [...parsed.searchParams.entries()];
+  } catch {
+    const q = url.split("?")[1];
+    if (!q) return [];
+    return q.split("&").map((part) => {
+      const [k, ...rest] = part.split("=");
+      return [decodeURIComponent(k || ""), decodeURIComponent(rest.join("=") || "")] as [string, string];
+    });
+  }
+}
+
+function capturedFrom(e: NetworkEntry) {
+  return e.requestHeaders?.["X-Captured-From"] || "";
 }
 
 function getMethodColor(method?: string) {
@@ -134,7 +160,7 @@ export function NetworkView({
       if (filter === "success" && (isFailed || (e.status && e.status >= 400))) return false;
 
       if (q) {
-        const full = `${e.method || ""} ${entryUrl(e)} ${e.host || ""} ${e.path || ""} ${e.status || ""}`.toLowerCase();
+        const full = `${e.method || ""} ${displayUrl(e)} ${e.host || ""} ${e.path || ""} ${e.status || ""}`.toLowerCase();
         if (!full.includes(q)) return false;
       }
       return true;
@@ -209,7 +235,7 @@ export function NetworkView({
                 onClick={() => setSelectedId(isSelected ? null : e.id)}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "64px 1fr 110px 64px 64px",
+                  gridTemplateColumns: "72px minmax(0, 1fr) 110px 64px 64px",
                   gap: 8,
                   padding: "5px 12px",
                   alignItems: "center",
@@ -232,17 +258,19 @@ export function NetworkView({
               >
                 <span style={{ color: methodColor, fontWeight: 700 }}>{e.method || "GET"}</span>
                 <span
-                  title={entryUrl(e)}
+                  title={displayUrl(e)}
                   style={{
                     color: isFailed ? "#ff453a" : "var(--text)",
                     wordBreak: "break-all",
-                    whiteSpace: "normal",
-                    lineHeight: 1.35,
+                    overflowWrap: "anywhere",
+                    whiteSpace: "pre-wrap",
+                    lineHeight: 1.4,
                     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
                     fontSize: 11,
+                    minWidth: 0,
                   }}
                 >
-                  {entryUrl(e)}
+                  {displayUrl(e)}
                 </span>
                 <span>
                   <span
@@ -285,9 +313,11 @@ function RequestDetail({
   entry: NetworkEntry;
   onClose: () => void;
 }) {
-  const [pane, setPane] = useState<"request" | "response">("request");
+  const [pane, setPane] = useState<"request" | "response" | "query">("request");
   const badge = getStatusBadge(entry.status, entry.encrypted);
   const url = entryUrl(entry);
+  const params = queryParams(url);
+  const source = capturedFrom(entry);
 
   return (
     <div
@@ -314,12 +344,23 @@ function RequestDetail({
               color: "var(--text)",
               fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
               wordBreak: "break-all",
+              overflowWrap: "anywhere",
+              whiteSpace: "pre-wrap",
               marginTop: 4,
-              lineHeight: 1.4,
+              lineHeight: 1.45,
+              userSelect: "text",
             }}
           >
             {url}
           </div>
+          {entry.path ? (
+            <div style={{ color: "var(--muted)", marginTop: 4, wordBreak: "break-all" }}>
+              path {entry.path}
+            </div>
+          ) : null}
+          {source ? (
+            <div style={{ color: "#64d2ff", marginTop: 4 }}>{source}</div>
+          ) : null}
         </div>
         <button className="icon-btn" style={{ width: 22, height: 22, flexShrink: 0 }} onClick={onClose}>
           ×
@@ -340,13 +381,21 @@ function RequestDetail({
           {badge.label}
         </span>
         <span style={{ color: "var(--muted)", marginLeft: 8 }}>
+          {entry.host ? `${entry.host} · ` : ""}
           {entry.durationMs != null ? `${entry.durationMs} ms` : "—"}
           {entry.size != null ? ` · ${entry.size} B` : ""}
         </span>
+        <button
+          className="surface-btn"
+          style={{ width: "auto", padding: "2px 8px", marginLeft: 8, fontSize: 10 }}
+          onClick={() => navigator.clipboard.writeText(url)}
+        >
+          Copy URL
+        </button>
       </div>
 
-      <div style={{ display: "flex", gap: 4 }}>
-        {(["request", "response"] as const).map((tab) => (
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+        {(["request", "response", "query"] as const).map((tab) => (
           <button
             key={tab}
             className="surface-btn"
@@ -360,7 +409,7 @@ function RequestDetail({
               color: pane === tab ? "#0a84ff" : "inherit",
             }}
           >
-            {tab === "request" ? "Request" : "Response"}
+            {tab === "request" ? "Request" : tab === "response" ? "Response" : `Query (${params.length})`}
           </button>
         ))}
       </div>
@@ -372,25 +421,30 @@ function RequestDetail({
             title="Request body"
             body={entry.requestBody}
             empty={
-              entry.encrypted
-                ? "HTTPS tunnel — request body is encrypted and cannot be shown."
+              (entry.method || "").toUpperCase() === "CONNECT" || (entry.encrypted && !source)
+                ? "HTTPS tunnel — path/body are inside TLS. Full URLs also appear here when the app logs them (OkHttp)."
                 : "No request body."
             }
           />
         </>
-      ) : (
+      ) : pane === "response" ? (
         <>
           <HeaderTable title="Response headers" headers={entry.responseHeaders} />
           <BodyBlock
             title="Response body"
             body={entry.responseBody}
             empty={
-              entry.encrypted
-                ? "HTTPS tunnel — response body is encrypted and cannot be shown."
+              (entry.method || "").toUpperCase() === "CONNECT" || (entry.encrypted && !source)
+                ? "HTTPS tunnel — response body is encrypted."
                 : "No response body."
             }
           />
         </>
+      ) : (
+        <HeaderTable
+          title="Query parameters"
+          headers={Object.fromEntries(params)}
+        />
       )}
     </div>
   );

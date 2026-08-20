@@ -25,8 +25,10 @@ use crashes::CrashLog;
 use devices::{list_merged, ConnectionStatus, DeviceInfo, DeviceRegistry};
 use error::{AppError, Result};
 use keys::{command_to_keyevent, field_update_actions, InputAction};
-use logcat::{is_crash_line, spawn_logcat, LogLine, LogcatHub};
-use proxy::NetworkLog;
+use logcat::{
+    extract_http, is_crash_line, is_stack_followup, spawn_logcat, LogLine, LogcatHub,
+};
+use proxy::{NetworkEntry, NetworkLog};
 use scrcpy::{editor_text, keyboard_focused, parse_now_playing, ScrcpySession, StreamStatus};
 use settings::Settings;
 
@@ -509,8 +511,21 @@ async fn restart_logcat(app: AppHandle, state: &AppState, serial: String) {
     let app2 = app.clone();
     let log_state = state.log_buffer.clone();
     let crash_adb = state.adb.lock().await.clone();
+    let network = state.network.clone();
     let mut fanout_stop = rx;
     tokio::spawn(async move {
+        struct PendingCrash {
+            kind: String,
+            process: String,
+            reason: String,
+            stack: String,
+            pid: i32,
+            last: std::time::Instant,
+        }
+        let mut pending: Option<PendingCrash> = None;
+        let flush_crash = |pending: &mut Option<PendingCrash>| {
+            pending.take()
+        };
         loop {
             tokio::select! {
                 _ = fanout_stop.changed() => {
@@ -528,13 +543,70 @@ async fn restart_logcat(app: AppHandle, state: &AppState, serial: String) {
                         }
                     }
                     let _ = app2.emit("logcat", line.clone());
+
+                    if let Some(http) = extract_http(&line) {
+                        let mut headers = std::collections::HashMap::new();
+                        headers.insert("X-Captured-From".into(), format!("logcat:{}", line.tag));
+                        headers.insert("X-Log-Line".into(), line.message.clone());
+                        let entry = NetworkEntry {
+                            id: format!("log-{}", line.id),
+                            started_at: chrono::Utc::now().timestamp_millis() as u64,
+                            method: http.method,
+                            url: http.url,
+                            host: http.host,
+                            path: http.path,
+                            status: http.status,
+                            duration_ms: http.duration_ms,
+                            size: None,
+                            encrypted: http.encrypted,
+                            request_headers: headers,
+                            response_headers: Default::default(),
+                            request_body: None,
+                            response_body: None,
+                        };
+                        let entry = network.upsert_from_log(entry);
+                        let _ = app2.emit("network", entry);
+                    }
+
+                    let mut ready = None;
                     if let Some((kind, process, reason)) = is_crash_line(&line) {
-                        let stack = crashes::enrich_from_device(&crash_adb, &serial, &line).await;
-                        let entry = crashes.push(kind, process, reason, stack);
+                        ready = flush_crash(&mut pending);
+                        pending = Some(PendingCrash {
+                            kind: kind.to_string(),
+                            process,
+                            reason,
+                            stack: format!("{} {}: {}", line.time, line.tag, line.message),
+                            pid: line.pid,
+                            last: std::time::Instant::now(),
+                        });
+                    } else if let Some(p) = pending.as_mut() {
+                        if is_stack_followup(&line) {
+                            p.stack.push('\n');
+                            p.stack.push_str(&format!(
+                                "{} {} {}: {}",
+                                line.time, line.level, line.tag, line.message
+                            ));
+                            p.last = std::time::Instant::now();
+                            if p.stack.lines().count() > 160 {
+                                ready = flush_crash(&mut pending);
+                            }
+                        } else if p.last.elapsed() > Duration::from_millis(700) {
+                            ready = flush_crash(&mut pending);
+                        }
+                    }
+                    if let Some(p) = ready {
+                        let stack =
+                            crashes::enrich_from_device(&crash_adb, &serial, &p.stack).await;
+                        let entry = crashes.push(&p.kind, p.process, p.reason, stack, p.pid);
                         let _ = app2.emit("crash", entry);
                     }
                 }
             }
+        }
+        if let Some(p) = pending {
+            let stack = crashes::enrich_from_device(&crash_adb, &serial, &p.stack).await;
+            let entry = crashes.push(&p.kind, p.process, p.reason, stack, p.pid);
+            let _ = app2.emit("crash", entry);
         }
     });
 }
@@ -564,7 +636,13 @@ async fn export_logcat(state: State<'_, Arc<AppState>>) -> Result<String> {
     let buf = state.log_buffer.lock().await;
     let body = buf
         .iter()
-        .map(|l| format!("{} {} {} {}: {}", l.time, l.level, l.pid, l.tag, l.message))
+        .map(|l| {
+            if l.raw.is_empty() {
+                format!("{} {} {} {}: {}", l.time, l.level, l.pid, l.tag, l.message)
+            } else {
+                l.raw.clone()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(&path, body)?;
@@ -818,6 +896,7 @@ async fn fix_port_5555(state: State<'_, Arc<AppState>>, serial: String) -> Resul
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let resource_dir = app
                 .path()

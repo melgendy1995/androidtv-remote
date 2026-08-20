@@ -64,7 +64,7 @@ export function LogcatView({
       if (!l || !l.level) return false;
       if (LEVELS.indexOf(l.level as LogLevel) < min) return false;
       if (t && (!l.tag || !l.tag.toLowerCase().includes(t))) return false;
-      const hay = `${l.tag || ""} ${l.message || ""}`.toLowerCase();
+      const hay = `${l.tag || ""} ${l.message || ""} ${l.raw || ""} ${l.pid || ""}`.toLowerCase();
       if (q && !hay.includes(q)) return false;
       if (p && !hay.includes(p)) return false;
       return true;
@@ -74,8 +74,12 @@ export function LogcatView({
   const virtualizer = useVirtualizer({
     count: filtered.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 22,
-    overscan: 25,
+    estimateSize: (index) => {
+      const msg = filtered[index]?.message || "";
+      return Math.min(140, 24 + Math.ceil(msg.length / 90) * 16);
+    },
+    overscan: 20,
+    measureElement: (el) => el.getBoundingClientRect().height,
   });
 
   return (
@@ -175,6 +179,8 @@ export function LogcatView({
               return (
                 <div
                   key={l.id ?? v.index}
+                  data-index={v.index}
+                  ref={virtualizer.measureElement}
                   onClick={() => setSelectedLine(isSelected ? null : l)}
                   className="log-line"
                   style={{
@@ -183,7 +189,6 @@ export function LogcatView({
                     left: 0,
                     width: "100%",
                     transform: `translateY(${v.start}px)`,
-                    height: 22,
                     cursor: "pointer",
                     background: isSelected
                       ? "rgba(10, 132, 255, 0.25)"
@@ -212,6 +217,9 @@ export function LogcatView({
                   >
                     {l.level || "I"}
                   </span>
+                  <span style={{ fontSize: 10, color: "var(--muted)", fontVariantNumeric: "tabular-nums" }}>
+                    {l.pid || "—"}
+                  </span>
                   <span
                     style={{
                       color: tagColor,
@@ -234,7 +242,8 @@ export function LogcatView({
         {selectedLine ? (
           <div
             style={{
-              width: 320,
+              width: "min(420px, 46%)",
+              minWidth: 280,
               borderLeft: "1px solid var(--border)",
               background: "#111115",
               padding: 14,
@@ -277,20 +286,20 @@ export function LogcatView({
             <div>
               <div style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase" }}>Time & Process</div>
               <div style={{ color: "var(--text)", fontSize: 11, fontVariantNumeric: "tabular-nums" }}>
-                {selectedLine.time || "—"} · PID: {selectedLine.pid || "—"} · TID: {selectedLine.tid || "—"}
+                {selectedLine.time || "—"} · PID {selectedLine.pid || "—"} · TID {selectedLine.tid || "—"}
               </div>
             </div>
 
             <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
               <div style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", marginBottom: 4 }}>
-                Message
+                Full message
               </div>
               <textarea
                 readOnly
                 value={selectedLine.message}
                 style={{
                   flex: 1,
-                  minHeight: 120,
+                  minHeight: 140,
                   background: "rgba(0,0,0,0.5)",
                   color: LEVEL_COLORS[selectedLine.level]?.fg || "#fff",
                   border: "1px solid var(--border)",
@@ -299,16 +308,43 @@ export function LogcatView({
                   fontSize: 11,
                   fontFamily: "monospace",
                   resize: "none",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
                 }}
               />
             </div>
+
+            {selectedLine.raw && selectedLine.raw !== selectedLine.message ? (
+              <div>
+                <div style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", marginBottom: 4 }}>
+                  Raw logcat
+                </div>
+                <pre
+                  style={{
+                    margin: 0,
+                    padding: 8,
+                    background: "#060608",
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    fontSize: 10,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    maxHeight: 120,
+                    overflow: "auto",
+                  }}
+                >
+                  {selectedLine.raw}
+                </pre>
+              </div>
+            ) : null}
 
             <button
               className="surface-btn"
               style={{ fontSize: 12, padding: "6px 10px" }}
               onClick={() => {
                 navigator.clipboard.writeText(
-                  `[${selectedLine.time}] ${selectedLine.level}/${selectedLine.tag}: ${selectedLine.message}`
+                  selectedLine.raw ||
+                    `[${selectedLine.time}] ${selectedLine.level}/${selectedLine.tag}(${selectedLine.pid}): ${selectedLine.message}`
                 );
               }}
             >

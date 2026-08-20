@@ -16,6 +16,8 @@ pub struct LogLine {
     pub level: String,
     pub tag: String,
     pub message: String,
+    #[serde(default)]
+    pub raw: String,
 }
 
 pub struct LogcatHub {
@@ -106,6 +108,7 @@ fn try_parse_threadtime(raw: &str, id: u64) -> Option<LogLine> {
         level,
         tag,
         message,
+        raw: raw.to_string(),
     })
 }
 
@@ -114,7 +117,8 @@ pub fn parse_threadtime(raw: &str, id: u64) -> Option<LogLine> {
     if raw_trimmed.is_empty() {
         return None;
     }
-    if let Some(line) = try_parse_threadtime(raw_trimmed, id) {
+    if let Some(mut line) = try_parse_threadtime(raw_trimmed, id) {
+        line.raw = raw_trimmed.to_string();
         return Some(line);
     }
     Some(LogLine {
@@ -125,6 +129,7 @@ pub fn parse_threadtime(raw: &str, id: u64) -> Option<LogLine> {
         level: "I".to_string(),
         tag: "system".to_string(),
         message: raw_trimmed.to_string(),
+        raw: raw_trimmed.to_string(),
     })
 }
 
@@ -134,12 +139,198 @@ pub fn is_crash_line(line: &LogLine) -> Option<(&'static str, String, String)> {
     if lower.contains("fatal exception")
         || line.tag == "AndroidRuntime" && lower.contains("fatal")
         || lower.contains("am_crash")
+        || lower.contains("fatal signal")
+        || lower.contains("native crash")
     {
         return Some(("crash", line.tag.clone(), line.message.clone()));
     }
-    if lower.contains("anr in") || lower.contains("am_anr") || line.tag == "ActivityManager" && lower.contains("anr")
+    if lower.contains("anr in")
+        || lower.contains("am_anr")
+        || (line.tag == "ActivityManager" && lower.contains("anr"))
     {
         return Some(("anr", line.tag.clone(), line.message.clone()));
     }
     None
+}
+
+pub fn is_stack_followup(line: &LogLine) -> bool {
+    let tag = line.tag.as_str();
+    if matches!(
+        tag,
+        "AndroidRuntime" | "DEBUG" | "libc" | "tombstoned" | "CrashAnrDetector" | "ActivityManager"
+    ) {
+        return true;
+    }
+    let m = line.message.trim_start();
+    m.starts_with("at ")
+        || m.starts_with("Caused by:")
+        || m.starts_with("Process:")
+        || m.starts_with("PID:")
+        || m.starts_with("UID:")
+        || m.starts_with("signal ")
+        || m.starts_with("Abort message")
+        || m.starts_with("backtrace:")
+        || m.starts_with('#')
+        || m.contains("java.")
+        || m.contains("kotlin.")
+}
+
+#[derive(Debug, Clone)]
+pub struct LoggedHttp {
+    pub method: String,
+    pub url: String,
+    pub host: String,
+    pub path: String,
+    pub status: Option<u16>,
+    pub duration_ms: Option<u64>,
+    pub encrypted: bool,
+}
+
+pub fn extract_http(line: &LogLine) -> Option<LoggedHttp> {
+    let url = find_http_url(&line.message)?;
+    let encrypted = url.starts_with("https://");
+    let (host, path) = split_host_path(&url);
+    if host.contains("schemas.android.com") || host.contains("w3.org") {
+        return None;
+    }
+    let method = find_http_method(&line.message).unwrap_or_else(|| "GET".into());
+    let status = find_http_status(&line.message);
+    let duration_ms = find_duration_ms(&line.message);
+    Some(LoggedHttp {
+        method,
+        url,
+        host,
+        path,
+        status,
+        duration_ms,
+        encrypted,
+    })
+}
+
+fn find_http_url(text: &str) -> Option<String> {
+    let start = text.find("https://").or_else(|| text.find("http://"))?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | ',')
+        })
+        .unwrap_or(rest.len());
+    let mut url = rest[..end].to_string();
+    while url.ends_with(['.', ';', ':', '"', '\'']) {
+        url.pop();
+    }
+    if url.len() < 10 {
+        return None;
+    }
+    Some(url)
+}
+
+fn split_host_path(url: &str) -> (String, String) {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    if let Some((host, path)) = rest.split_once('/') {
+        (host.to_string(), format!("/{path}"))
+    } else if let Some((host, query)) = rest.split_once('?') {
+        (host.to_string(), format!("/?{query}"))
+    } else {
+        (rest.to_string(), "/".into())
+    }
+}
+
+fn find_http_method(text: &str) -> Option<String> {
+    for method in ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "GET", "CONNECT"] {
+        if let Some(idx) = text.find(method) {
+            let after = idx + method.len();
+            if after >= text.len() || text.as_bytes()[after].is_ascii_whitespace() {
+                return Some(method.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_http_status(text: &str) -> Option<u16> {
+    let window = if let Some(idx) = text.find("<--") {
+        &text[idx..]
+    } else if let Some(idx) = text.find("HTTP/") {
+        &text[idx..]
+    } else {
+        return None;
+    };
+    for token in window.split(|c: char| !c.is_ascii_digit()) {
+        if token.len() == 3 {
+            if let Ok(code) = token.parse::<u16>() {
+                if (100..600).contains(&code) {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_duration_ms(text: &str) -> Option<u64> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(idx) = lower.find("ms") {
+        let before = &text[..idx];
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if !digits.is_empty() {
+            return digits.parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_okhttp_full_url_with_query() {
+        let line = LogLine {
+            id: 1,
+            time: "01-01 12:00:00.000".into(),
+            pid: 1,
+            tid: 1,
+            level: "D".into(),
+            tag: "OkHttp".into(),
+            message: "--> GET https://api.intigral-ott.net/cms/v1/page?id=12&lang=en http/1.1"
+                .into(),
+            raw: String::new(),
+        };
+        let http = extract_http(&line).expect("url");
+        assert_eq!(http.method, "GET");
+        assert_eq!(
+            http.url,
+            "https://api.intigral-ott.net/cms/v1/page?id=12&lang=en"
+        );
+        assert_eq!(http.path, "/cms/v1/page?id=12&lang=en");
+        assert!(http.encrypted);
+    }
+
+    #[test]
+    fn extracts_status_and_duration() {
+        let line = LogLine {
+            id: 2,
+            time: String::new(),
+            pid: 1,
+            tid: 1,
+            level: "D".into(),
+            tag: "OkHttp".into(),
+            message: "<-- 200 OK https://api.example.com/v2/foo (145ms)".into(),
+            raw: String::new(),
+        };
+        let http = extract_http(&line).expect("url");
+        assert_eq!(http.status, Some(200));
+        assert_eq!(http.duration_ms, Some(145));
+    }
 }

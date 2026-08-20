@@ -68,6 +68,34 @@ impl NetworkLog {
         self.next_id.fetch_add(1, Ordering::Relaxed).to_string()
     }
 
+    pub fn upsert_from_log(&self, entry: NetworkEntry) -> NetworkEntry {
+        let mut lock = self.entries.lock().unwrap();
+        if let Some(existing) = lock.iter_mut().rev().take(120).find(|e| {
+            e.id.starts_with("log-") && !e.url.is_empty() && e.url == entry.url
+        }) {
+            if entry.status.is_some() {
+                existing.status = entry.status;
+            }
+            if entry.duration_ms.is_some() {
+                existing.duration_ms = entry.duration_ms;
+            }
+            if existing.method == "GET" && entry.method != "GET" {
+                existing.method = entry.method.clone();
+            }
+            if let Some(line) = entry.request_headers.get("X-Log-Line") {
+                existing
+                    .request_headers
+                    .insert("X-Log-Line".into(), line.clone());
+            }
+            return existing.clone();
+        }
+        lock.push(entry.clone());
+        if lock.len() > 2000 {
+            lock.remove(0);
+        }
+        entry
+    }
+
     pub fn export_har(&self) -> Result<String> {
         let entries = self.list();
         let dir = crate::paths::default_capture_dir();
@@ -158,9 +186,9 @@ async fn handle_client(
             id: log.next_id(),
             started_at: started,
             method,
-            url: entry_url(true, &host, "/"),
+            url: entry_url(true, &host, ""),
             host,
-            path: "/".into(),
+            path: String::new(),
             status: None,
             duration_ms: None,
             size: None,
@@ -295,9 +323,17 @@ fn parse_status(resp: &[u8]) -> Option<u16> {
 
 fn entry_url(encrypted: bool, host: &str, path: &str) -> String {
     let scheme = if encrypted { "https" } else { "http" };
-    let host = host.strip_suffix(":443").unwrap_or(host);
-    let path = if path.is_empty() { "/" } else { path };
-    format!("{scheme}://{host}{path}")
+    let host = host
+        .strip_suffix(":443")
+        .or_else(|| host.strip_suffix(":80"))
+        .unwrap_or(host);
+    if path.is_empty() {
+        format!("{scheme}://{host}")
+    } else if path.starts_with('/') {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}/{path}")
+    }
 }
 
 fn parse_headers_and_body(raw: &[u8]) -> (std::collections::HashMap<String, String>, Option<String>) {
@@ -331,7 +367,7 @@ fn preview_body(body: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    const MAX: usize = 16_000;
+    const MAX: usize = 64_000;
     let count = trimmed.chars().count();
     if count <= MAX {
         return Some(trimmed.to_string());
@@ -356,8 +392,8 @@ mod tests {
     #[test]
     fn builds_https_url_without_default_port() {
         assert_eq!(
-            entry_url(true, "netflix.com:443", "/"),
-            "https://netflix.com/"
+            entry_url(true, "netflix.com:443", "/browse?q=tv"),
+            "https://netflix.com/browse?q=tv"
         );
     }
 
