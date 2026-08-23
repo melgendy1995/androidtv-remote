@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::paths::{ensure_dir, settings_path};
+use crate::paths::{ensure_parent_dir, settings_path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +51,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             adb_path: String::new(),
-            proxy_port: 8888,
+            proxy_port: default_proxy_port(),
             capture_dir: String::new(),
             max_size: 1920,
             bit_rate: 8000000,
@@ -75,7 +75,7 @@ impl Settings {
 
     pub fn save(&self) -> crate::error::Result<()> {
         let path = settings_path();
-        ensure_dir(&path)?;
+        ensure_parent_dir(&path)?;
         std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }

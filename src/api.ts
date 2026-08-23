@@ -20,6 +20,8 @@ export const api = {
   connectHost: (host: string) => invoke<DeviceInfo>("connect_host", { host }),
   pairWireless: (host: string, code: string) =>
     invoke<string>("pair_wireless", { host, code }),
+  connectAfterPair: (host: string) =>
+    invoke<DeviceInfo>("connect_after_pair", { host }),
   disconnect: () => invoke<void>("disconnect_device"),
   forget: (serial: string) => invoke<void>("forget_device", { serial }),
   sendKey: (command: string) => invoke<void>("send_key", { command }),

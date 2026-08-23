@@ -38,6 +38,10 @@ impl CrashLog {
         self.entries.lock().unwrap().clone()
     }
 
+    pub fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+
     pub fn get(&self, id: &str) -> Option<CrashEntry> {
         self.entries
             .lock()

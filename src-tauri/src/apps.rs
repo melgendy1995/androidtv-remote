@@ -2,6 +2,7 @@ use serde::Serialize;
 
 use crate::adb::AdbClient;
 use crate::error::{AppError, Result};
+use crate::sanitize::validate_package;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,17 +85,19 @@ fn friendly_label(pkg: &str) -> String {
 }
 
 pub async fn launch_app(adb: &AdbClient, serial: &str, package_name: &str) -> Result<()> {
-    let cmd = format!("monkey -p {package_name} -c android.intent.category.LAUNCHER 1");
+    let pkg = validate_package(package_name)?;
+    let cmd = format!("monkey -p {pkg} -c android.intent.category.LAUNCHER 1");
     let out = adb.shell(serial, &cmd).await?;
     if out.contains("No activities found to run") {
-        let cmd_tv = format!("monkey -p {package_name} -c android.intent.category.LEANBACK_LAUNCHER 1");
+        let cmd_tv = format!("monkey -p {pkg} -c android.intent.category.LEANBACK_LAUNCHER 1");
         let _ = adb.shell(serial, &cmd_tv).await;
     }
     Ok(())
 }
 
 pub async fn force_stop_app(adb: &AdbClient, serial: &str, package_name: &str) -> Result<()> {
-    let cmd = format!("am force-stop {package_name}");
+    let pkg = validate_package(package_name)?;
+    let cmd = format!("am force-stop {pkg}");
     adb.shell(serial, &cmd).await?;
     Ok(())
 }
@@ -115,7 +118,8 @@ pub async fn install_apk(adb: &AdbClient, serial: &str, file_path: &str) -> Resu
 }
 
 pub async fn uninstall_app(adb: &AdbClient, serial: &str, package_name: &str) -> Result<()> {
-    let out = adb.run_serial(Some(serial), &["uninstall", package_name]).await?;
+    let pkg = validate_package(package_name)?;
+    let out = adb.run_serial(Some(serial), &["uninstall", pkg]).await?;
     if out.contains("Success") {
         Ok(())
     } else {

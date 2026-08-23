@@ -47,7 +47,9 @@ This document outlines the full multi-phase development plan for expanding the *
   - `upload_file` (`adb push`) & `download_file` (`adb pull`).
   - File deletion and directory creation.
 - [x] **Audio & Video Streaming Configuration**:
-  - Configurable Scrcpy max resolution (720p, 1080p, Native), bitrate (2M, 8M, 16M), max FPS, and audio forwarding toggles.
+  - Configurable Scrcpy max resolution (720p, 1080p, Native), bitrate (2M, 8M, 16M), max FPS.
+- [ ] Audio forwarding — NOT implemented (scrcpy server supports it; the app
+  rejects `audio=true` with "Audio streaming is not implemented yet").
 
 ---
 

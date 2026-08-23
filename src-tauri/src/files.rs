@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::adb::AdbClient;
 use crate::error::{AppError, Result};
+use crate::sanitize::{escape_shell_arg, validate_remote_path};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,10 +19,10 @@ pub async fn list_files(adb: &AdbClient, serial: &str, target_path: &str) -> Res
     let path = if target_path.trim().is_empty() {
         "/sdcard"
     } else {
-        target_path.trim()
+        validate_remote_path(target_path)?
     };
 
-    let cmd = format!("ls -la \"{path}\"");
+    let cmd = format!("ls -la \"{}\"", escape_shell_arg(path));
     let output = adb.shell(serial, &cmd).await?;
 
     let mut files = Vec::new();
@@ -38,7 +39,9 @@ pub async fn list_files(adb: &AdbClient, serial: &str, target_path: &str) -> Res
         }
 
         let permissions = parts[0];
-        let is_dir = permissions.starts_with('d') || permissions.starts_with('l');
+        // Symlinks ('l') are NOT directories — following one into a file
+        // broke navigation; the link name also carries a " -> target" tail.
+        let is_dir = permissions.starts_with('d');
 
         let mut name_idx = 6;
         let mut size: u64 = 0;
@@ -56,7 +59,12 @@ pub async fn list_files(adb: &AdbClient, serial: &str, target_path: &str) -> Res
             }
         }
 
-        let name = parts[name_idx..].join(" ");
+        let mut name = parts[name_idx..].join(" ");
+        // `ls -la` renders symlinks as "name -> /target"; keep only the name
+        // so clicking navigates to the link itself.
+        if let Some((real, _target)) = name.split_once(" -> ") {
+            name = real.to_string();
+        }
         if name == "." || name == ".." {
             continue;
         }
@@ -94,7 +102,11 @@ pub async fn pull_file(
     local_path: &str,
 ) -> Result<()> {
     let out = adb
-        .run_serial(Some(serial), &["pull", remote_path, local_path])
+        .run_serial_timeout(
+            Some(serial),
+            &["pull", remote_path, local_path],
+            std::time::Duration::from_secs(600),
+        )
         .await?;
     if out.contains("error") || out.contains("failed") {
         Err(AppError::from(format!("Pull failed: {out}")))
@@ -113,13 +125,15 @@ pub async fn push_file(
 }
 
 pub async fn delete_file(adb: &AdbClient, serial: &str, remote_path: &str) -> Result<()> {
-    let cmd = format!("rm -rf \"{remote_path}\"");
+    let path = validate_remote_path(remote_path)?;
+    let cmd = format!("rm -rf \"{}\"", escape_shell_arg(path));
     adb.shell(serial, &cmd).await?;
     Ok(())
 }
 
 pub async fn mkdir_remote(adb: &AdbClient, serial: &str, remote_path: &str) -> Result<()> {
-    let cmd = format!("mkdir -p \"{remote_path}\"");
+    let path = validate_remote_path(remote_path)?;
+    let cmd = format!("mkdir -p \"{}\"", escape_shell_arg(path));
     adb.shell(serial, &cmd).await?;
     Ok(())
 }

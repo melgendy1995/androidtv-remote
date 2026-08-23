@@ -241,10 +241,20 @@ export function StageView({
           if (!connected || !canvasRef.current) return;
           const canvas = canvasRef.current;
           const rect = canvas.getBoundingClientRect();
-          const x = e.clientX - rect.left;
-          const y = e.clientY - rect.top;
-          if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
-          onTap(x, y, rect.width, rect.height);
+          // Map through the drawn video rect (object-fit: contain), not the
+          // element box — clicks in letterbox bars must be ignored.
+          const vw = stream.width || canvas.width;
+          const vh = stream.height || canvas.height;
+          if (!vw || !vh || rect.width === 0 || rect.height === 0) return;
+          const scale = Math.min(rect.width / vw, rect.height / vh);
+          const drawW = vw * scale;
+          const drawH = vh * scale;
+          const offX = (rect.width - drawW) / 2;
+          const offY = (rect.height - drawH) / 2;
+          const x = e.clientX - rect.left - offX;
+          const y = e.clientY - rect.top - offY;
+          if (x < 0 || y < 0 || x > drawW || y > drawH) return;
+          onTap(x, y, drawW, drawH);
         }}
       >
         <canvas

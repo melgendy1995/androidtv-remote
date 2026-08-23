@@ -405,7 +405,10 @@ async fn client_loop(
                 if *stop.borrow() { break; }
             }
             msg = incoming.next() => {
-                if msg.is_none() { break; }
+                match msg {
+                    Some(Ok(_)) => {}
+                    _ => break,
+                }
             }
             pkt = rx.recv() => {
                 match pkt {
@@ -568,8 +571,14 @@ where
 }
 
 async fn mark_stopped(session: &ScrcpySession, error: Option<String>) {
+    // Release the stop watch so ws_loop / client_loop tasks exit instead of
+    // leaking listeners on an orphaned port after a failed start.
+    if let Some(tx) = session.stop.lock().await.take() {
+        let _ = tx.send(true);
+    }
     let mut status = session.status.lock().await;
     status.streaming = false;
+    status.video_port = None;
     status.error = error;
 }
 

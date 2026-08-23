@@ -39,7 +39,11 @@ pub fn escape_input_text(text: &str) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum InputAction {
     Keyevents(Vec<&'static str>),
+    /// ASCII-safe payload for `adb shell input text`.
     Text(String),
+    /// Payload containing non-ASCII characters (`input text` drops them);
+    /// deliver via device clipboard + paste.
+    PasteText(String),
 }
 
 pub fn field_update_actions(previous: &str, next: &str) -> Vec<InputAction> {
@@ -47,25 +51,34 @@ pub fn field_update_actions(previous: &str, next: &str) -> Vec<InputAction> {
         return Vec::new();
     }
     if let Some(suffix) = next.strip_prefix(previous) {
-        let escaped = escape_input_text(suffix);
-        if escaped.is_empty() {
-            return Vec::new();
-        }
-        return vec![
-            InputAction::Keyevents(vec!["KEYCODE_MOVE_END"]),
-            InputAction::Text(escaped),
-        ];
+        return append_text(Vec::new(), true, suffix);
     }
     if previous.starts_with(next) {
         return vec![backspace_from_end(
             previous.chars().count() - next.chars().count(),
         )];
     }
-    let mut actions = vec![backspace_from_end(previous.chars().count())];
-    let escaped = escape_input_text(next);
-    if !escaped.is_empty() {
-        actions.push(InputAction::Text(escaped));
+    let actions = vec![backspace_from_end(previous.chars().count())];
+    append_text(actions, false, next)
+}
+
+fn append_text(mut actions: Vec<InputAction>, move_end_first: bool, payload: &str) -> Vec<InputAction> {
+    if payload.is_empty() {
+        return actions;
     }
+    let ascii_safe = payload
+        .chars()
+        .all(|c| c.is_ascii_graphic() || c == ' ');
+    if move_end_first {
+        // Typing/pasting inserts at the cursor; ensure it sits at the end
+        // since we don't track the device's actual cursor position.
+        actions.push(InputAction::Keyevents(vec!["KEYCODE_MOVE_END"]));
+    }
+    actions.push(if ascii_safe {
+        InputAction::Text(escape_input_text(payload))
+    } else {
+        InputAction::PasteText(payload.to_string())
+    });
     actions
 }
 
@@ -105,6 +118,33 @@ mod tests {
                 "KEYCODE_DEL",
                 "KEYCODE_DEL",
             ])]
+        );
+    }
+
+    #[test]
+    fn non_ascii_text_uses_clipboard_paste_instead_of_input() {
+        // `input text` silently drops every non-ASCII char; these must be
+        // routed through clipboard+paste instead.
+        assert_eq!(
+            field_update_actions("", "مرحبا"),
+            vec![
+                InputAction::Keyevents(vec!["KEYCODE_MOVE_END"]),
+                InputAction::PasteText("مرحبا".into()),
+            ]
+        );
+        assert_eq!(
+            field_update_actions("abc", "abcé"),
+            vec![
+                InputAction::Keyevents(vec!["KEYCODE_MOVE_END"]),
+                InputAction::PasteText("é".into()),
+            ]
+        );
+        assert_eq!(
+            field_update_actions("abc", "abcx"),
+            vec![
+                InputAction::Keyevents(vec!["KEYCODE_MOVE_END"]),
+                InputAction::Text("x".into()),
+            ]
         );
     }
 }

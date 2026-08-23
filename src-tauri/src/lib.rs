@@ -10,6 +10,7 @@ mod logcat;
 mod paths;
 mod proxy;
 mod recorder;
+mod sanitize;
 mod scrcpy;
 mod settings;
 
@@ -45,6 +46,7 @@ pub struct AppState {
     network: Arc<NetworkLog>,
     resource_dir: std::path::PathBuf,
     proxy_port: Mutex<Option<u16>>,
+    last_ui_dump: Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -215,6 +217,70 @@ async fn pair_wireless(state: State<'_, Arc<AppState>>, host: String, code: Stri
     adb.pair(&host, &code).await
 }
 
+/// Connect right after pairing. Android 11+ wireless debugging uses a RANDOM
+/// connect port (shown on the TV), so never assume ip:5555: discover the
+/// endpoint via `adb mdns services` and the already-listed devices first,
+/// then fall back to 5555.
+#[tauri::command]
+async fn connect_after_pair(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    host: String,
+) -> Result<DeviceInfo> {
+    let adb = state.adb.lock().await.clone();
+    let ip = host.split(':').next().unwrap_or(&host).trim().to_string();
+    let prefix = format!("{ip}:");
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |c: String| {
+        if !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    };
+    if let Ok(out) = adb.run(&["mdns", "services"]).await {
+        for line in out.lines() {
+            if !line.contains("_adb-tls-connect._tcp") && !line.contains("_adb._tcp") {
+                continue;
+            }
+            for token in line.split_whitespace() {
+                let token = token.trim_matches('|');
+                if token.starts_with(&prefix) {
+                    push(token.to_string());
+                }
+            }
+        }
+    }
+    // Pairing often auto-connects; the serial shows up in `adb devices -l`.
+    if let Ok(raw) = adb.devices_raw().await {
+        for device in adb::parse_devices(&raw) {
+            if device.serial.starts_with(&prefix) {
+                push(device.serial);
+            }
+        }
+    }
+    push(format!("{ip}:5555"));
+    drop(adb);
+    for candidate in &candidates {
+        let state_ok = {
+            let adb = state.adb.lock().await.clone();
+            let is_ready =
+                |s: String| s == "device" || s == "unauthorized";
+            if is_ready(adb.get_state(candidate).await.unwrap_or_default()) {
+                true
+            } else {
+                let connected = adb.connect_host(candidate).await.is_ok();
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                connected && is_ready(adb.get_state(candidate).await.unwrap_or_default())
+            }
+        };
+        if state_ok {
+            return connect_serial(&app, &state, candidate.clone()).await;
+        }
+    }
+    Err(AppError::from(
+        "Paired, but could not find this TV's wireless-debugging port. Open Wireless debugging on the TV and use 'Add host' with the IP:port shown there, or use Lock Port 5555.",
+    ))
+}
+
 #[tauri::command]
 async fn disconnect_device(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<()> {
     let serial = state
@@ -291,18 +357,33 @@ async fn keyboard_snapshot(state: State<'_, Arc<AppState>>) -> Result<KeyboardSt
             || lower.contains("ime")
     };
     if focused && text.is_empty() || !focused && focus_hint {
-        let ui = adb
-            .shell(
-                &serial,
-                "uiautomator dump /data/local/tmp/uidump.xml >/dev/null 2>&1 || cmd uiautomator dump /data/local/tmp/uidump.xml >/dev/null 2>&1; cat /data/local/tmp/uidump.xml 2>/dev/null",
-            )
-            .await
-            .unwrap_or_default();
-        dump.push('\n');
-        dump.push_str(&ui);
-        focused = keyboard_focused(&dump);
-        if text.is_empty() {
-            text = editor_text(&ui);
+        // `uiautomator dump` takes 1-3 s on TVs; the frontend polls every
+        // 600 ms, so throttle the XML path or we saturate the device.
+        let should_dump = {
+            let mut last = state.last_ui_dump.lock().await;
+            let now = std::time::Instant::now();
+            let due = last
+                .map(|t| now.duration_since(t) >= Duration::from_secs(2))
+                .unwrap_or(true);
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if should_dump {
+            let ui = adb
+                .shell(
+                    &serial,
+                    "uiautomator dump /data/local/tmp/uidump.xml >/dev/null 2>&1 || cmd uiautomator dump /data/local/tmp/uidump.xml >/dev/null 2>&1; cat /data/local/tmp/uidump.xml 2>/dev/null",
+                )
+                .await
+                .unwrap_or_default();
+            dump.push('\n');
+            dump.push_str(&ui);
+            focused = keyboard_focused(&dump);
+            if text.is_empty() {
+                text = editor_text(&ui);
+            }
         }
     }
     Ok(KeyboardState { focused, text })
@@ -343,6 +424,14 @@ async fn apply_field_text(
             InputAction::Text(payload) => {
                 adb.shell(serial, &format!("input text {payload}")).await?;
             }
+            InputAction::PasteText(payload) => {
+                // Non-ASCII (Arabic, emoji…) is dropped by `input text`;
+                // deliver it via the device clipboard + paste keyevent.
+                clipboard::set_clipboard(adb, serial, &payload).await?;
+                adb.shell(serial, "input keyevent KEYCODE_MOVE_END")
+                    .await?;
+                adb.shell(serial, "input keyevent KEYCODE_PASTE").await?;
+            }
             InputAction::Keyevents(keys) => {
                 for chunk in keys.chunks(24) {
                     adb.shell(serial, &format!("input keyevent {}", chunk.join(" ")))
@@ -358,8 +447,23 @@ async fn apply_field_text(
 async fn keyboard_clear(state: State<'_, Arc<AppState>>) -> Result<()> {
     let serial = current_serial(&state).await?;
     let adb = state.adb.lock().await.clone();
-    adb.shell(&serial, "input keyevent KEYCODE_CTRL_A").await?;
-    adb.shell(&serial, "input keyevent KEYCODE_DEL").await?;
+    // `input keyevent KEYCODE_CTRL_A` does not apply the Ctrl meta state, so
+    // select-all silently no-ops on most devices. Use keycombination (11+)
+    // and fall back to select-all IME action / repeated delete.
+    let ok = adb
+        .shell(&serial, "input keycombination CTRL_LEFT A")
+        .await
+        .is_ok();
+    if ok {
+        adb.shell(&serial, "input keyevent KEYCODE_DEL").await?;
+    } else {
+        adb.shell(&serial, "input keyevent KEYCODE_MOVE_END").await?;
+        for _ in 0..3 {
+            let dels: Vec<&str> = std::iter::repeat("KEYCODE_DEL").take(24).collect();
+            adb.shell(&serial, &format!("input keyevent {}", dels.join(" ")))
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -381,26 +485,33 @@ async fn now_playing(state: State<'_, Arc<AppState>>) -> Result<NowPlaying> {
 }
 
 #[tauri::command]
-async fn start_stream(state: State<'_, Arc<AppState>>) -> Result<StreamStatus> {
+async fn start_stream(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<StreamStatus> {
     let serial = current_serial(&state).await?;
     let adb = state.adb.lock().await.clone();
-    let settings = state.settings.lock().await.clone();
+    let _settings = state.settings.lock().await.clone();
+    // Audio forwarding is not implemented; ignore any stale audioEnabled
+    // flag from an old settings file instead of failing the stream.
     let config = scrcpy::StreamConfig {
-        max_size: settings.max_size,
-        video_bit_rate: settings.bit_rate,
-        max_fps: settings.max_fps,
-        audio: settings.audio_enabled,
+        max_size: _settings.max_size,
+        video_bit_rate: _settings.bit_rate,
+        max_fps: _settings.max_fps,
+        audio: false,
     };
-    state
+    let status = state
         .scrcpy
         .clone()
         .start(adb, serial, state.resource_dir.clone(), config)
-        .await
+        .await;
+    if let Ok(s) = &status {
+        let _ = app.emit("stream", s);
+    }
+    status
 }
 
 #[tauri::command]
-async fn stop_stream(state: State<'_, Arc<AppState>>) -> Result<()> {
+async fn stop_stream(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<()> {
     state.scrcpy.stop().await;
+    let _ = app.emit("stream", state.scrcpy.snapshot().await);
     Ok(())
 }
 
@@ -428,7 +539,7 @@ async fn screenshot(state: State<'_, Arc<AppState>>) -> Result<String> {
 }
 
 #[tauri::command]
-async fn start_recording(state: State<'_, Arc<AppState>>) -> Result<String> {
+async fn start_recording(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String> {
     let status = state.scrcpy.snapshot().await;
     if !status.streaming {
         return Err(AppError::from("not streaming"));
@@ -445,12 +556,29 @@ async fn start_recording(state: State<'_, Arc<AppState>>) -> Result<String> {
         .scrcpy
         .recorder
         .start(&path, status.width, status.height, sps, pps)?;
-    Ok(path.to_string_lossy().to_string())
+    let path_s = path.to_string_lossy().to_string();
+    emit_recording_status(&app, &state).await;
+    Ok(path_s)
 }
 
 #[tauri::command]
-async fn stop_recording(state: State<'_, Arc<AppState>>) -> Result<String> {
-    state.scrcpy.recorder.finish()
+async fn stop_recording(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String> {
+    let result = state.scrcpy.recorder.finish();
+    emit_recording_status(&app, &state).await;
+    result
+}
+
+async fn emit_recording_status(app: &AppHandle, state: &AppState) {
+    let (recording, elapsed_ms, bytes, path) = state.scrcpy.recorder.status();
+    let _ = app.emit(
+        "recording",
+        RecordingStatus {
+            recording,
+            elapsed_ms,
+            bytes,
+            path,
+        },
+    );
 }
 
 #[tauri::command]
@@ -497,6 +625,11 @@ async fn restart_logcat(app: AppHandle, state: &AppState, serial: String) {
     if let Some(tx) = state.logcat_stop.lock().await.take() {
         let _ = tx.send(true);
     }
+    // Buffers are global; without this a device switch shows the previous
+    // TV's logs/crashes/network entries mixed with the new one.
+    state.log_buffer.lock().await.clear();
+    state.crashes.clear();
+    state.network.clear();
     let (tx, rx) = tokio::sync::watch::channel(false);
     *state.logcat_stop.lock().await = Some(tx);
     let adb = state.adb.lock().await.clone();
@@ -527,10 +660,27 @@ async fn restart_logcat(app: AppHandle, state: &AppState, serial: String) {
             pending.take()
         };
         loop {
+            // Flush a pending crash even when logcat goes quiet — otherwise
+            // the last crash of a burst sits invisible until the next line.
+            let flush_delay = match &pending {
+                Some(p) => tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(p.last + Duration::from_millis(700)),
+                ),
+                None => tokio::time::sleep(Duration::from_secs(3600)),
+            };
+            tokio::pin!(flush_delay);
             tokio::select! {
                 _ = fanout_stop.changed() => {
                     if *fanout_stop.borrow() {
                         break;
+                    }
+                }
+                _ = &mut flush_delay => {
+                    if let Some(p) = pending.take() {
+                        let stack =
+                            crashes::enrich_from_device(&crash_adb, &serial, &p.stack).await;
+                        let entry = crashes.push(&p.kind, p.process, p.reason, stack, p.pid);
+                        let _ = app2.emit("crash", entry);
                     }
                 }
                 line = sub.recv() => {
@@ -661,6 +811,10 @@ async fn save_crash(state: State<'_, Arc<AppState>>, id: String) -> Result<Strin
 
 #[tauri::command]
 async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<u16> {
+    start_proxy_inner(&app, &state).await
+}
+
+async fn start_proxy_inner(app: &AppHandle, state: &AppState) -> Result<u16> {
     let port = state.settings.lock().await.proxy_port;
     let log = state.network.clone();
     let app2 = app.clone();
@@ -669,27 +823,46 @@ async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
     })
     .await?;
     *state.proxy_port.lock().await = Some(bound);
-    if let Ok(serial) = current_serial(&state).await {
+    if let Ok(serial) = current_serial(state).await {
         let adb = state.adb.lock().await.clone();
-        attach_inspect_proxy(&adb, &serial, &state).await;
+        attach_inspect_proxy(&adb, &serial, state).await;
     }
     Ok(bound)
 }
 
 #[tauri::command]
 async fn stop_proxy(state: State<'_, Arc<AppState>>) -> Result<()> {
-    let mode = state.settings.lock().await.device_proxy_mode.clone();
-    if let Ok(serial) = current_serial(&state).await {
+    stop_proxy_inner(&state).await;
+    Ok(())
+}
+
+async fn stop_proxy_inner(state: &AppState) {
+    // Clear the device proxy regardless of mode — a dead listener must never
+    // be left configured on the TV.
+    if let Ok(serial) = current_serial(state).await {
         let adb = state.adb.lock().await.clone();
-        if mode != "charles" && mode != "off" {
-            let _ = adb.shell(&serial, "settings delete global http_proxy").await;
-        }
+        let _ = adb.shell(&serial, "settings delete global http_proxy").await;
         let _ = adb
-            .run_serial(Some(&serial), &["reverse", "--remove-all"])
+            .shell(&serial, "settings delete global global_http_proxy_host")
             .await;
+        let _ = adb
+            .shell(&serial, "settings delete global global_http_proxy_port")
+            .await;
+        remove_proxy_reverse(&adb, &serial, state).await;
     }
     *state.proxy_port.lock().await = None;
-    Ok(())
+}
+
+/// Remove only the inspect-proxy reverse tunnel. `reverse --remove-all`
+/// would also tear down the scrcpy reverse (`localabstract:scrcpy_<scid>`)
+/// and kill the live mirror.
+async fn remove_proxy_reverse(adb: &AdbClient, serial: &str, state: &AppState) {
+    let port = *state.proxy_port.lock().await;
+    if let Some(port) = port {
+        let _ = adb
+            .run_serial(Some(serial), &["reverse", "--remove", &format!("tcp:{port}")])
+            .await;
+    }
 }
 
 #[tauri::command]
@@ -714,11 +887,26 @@ async fn get_settings(state: State<'_, Arc<AppState>>) -> Result<Settings> {
 }
 
 #[tauri::command]
-async fn save_settings(state: State<'_, Arc<AppState>>, settings: Settings) -> Result<()> {
+async fn save_settings(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    settings: Settings,
+) -> Result<()> {
+    let port_changed = {
+        let current = state.settings.lock().await;
+        current.proxy_port != settings.proxy_port
+            || current.device_proxy_mode != settings.device_proxy_mode
+    };
+    let proxy_was_running = state.proxy_port.lock().await.is_some();
     settings.save()?;
     *state.settings.lock().await = settings.clone();
     *state.adb.lock().await = rebuild_adb(&settings, &state.resource_dir);
-    if let Ok(serial) = current_serial(&state).await {
+    // A changed listener port or device-proxy mode needs a restart to apply;
+    // previously it was silently ignored until the next app launch.
+    if proxy_was_running && port_changed {
+        stop_proxy_inner(&state).await;
+        start_proxy_inner(&app, &state).await?;
+    } else if let Ok(serial) = current_serial(&state).await {
         let adb = state.adb.lock().await.clone();
         attach_inspect_proxy(&adb, &serial, &state).await;
     }
@@ -917,6 +1105,7 @@ pub fn run() {
                 network: Arc::new(NetworkLog::new()),
                 resource_dir,
                 proxy_port: Mutex::new(None),
+                last_ui_dump: Mutex::new(None),
             });
             app.manage(state.clone());
             let handle = app.handle().clone();
@@ -931,6 +1120,7 @@ pub fn run() {
             connect_device,
             connect_host,
             pair_wireless,
+            connect_after_pair,
             disconnect_device,
             forget_device,
             send_key,
@@ -1005,13 +1195,16 @@ async fn cleanup_on_exit(state: &AppState) {
 async fn teardown_session(state: &AppState, serial: Option<&str>) {
     if let Some(serial) = serial {
         let adb = state.adb.lock().await.clone();
-        let mode = state.settings.lock().await.device_proxy_mode.clone();
-        if mode != "charles" && mode != "off" {
-            let _ = adb.shell(serial, "settings delete global http_proxy").await;
-        }
+        // Always clear the device proxy — Charles mode included — or a killed
+        // app leaves the TV pointing at a dead proxy with no internet.
+        let _ = adb.shell(serial, "settings delete global http_proxy").await;
         let _ = adb
-            .run_serial(Some(serial), &["reverse", "--remove-all"])
+            .shell(serial, "settings delete global global_http_proxy_host")
             .await;
+        let _ = adb
+            .shell(serial, "settings delete global global_http_proxy_port")
+            .await;
+        remove_proxy_reverse(&adb, serial, state).await;
         if serial.contains(':') {
             let _ = adb.disconnect(serial).await;
         }
@@ -1025,12 +1218,18 @@ async fn teardown_session(state: &AppState, serial: Option<&str>) {
 async fn attach_inspect_proxy(adb: &AdbClient, serial: &str, state: &AppState) {
     let settings = state.settings.lock().await.clone();
     match settings.device_proxy_mode.as_str() {
-        "off" => {}
+        // Re-apply (clear) on every connect so leftovers from a previous
+        // session or mode can't strand the TV behind a dead proxy.
+        "off" => {
+            let _ = adb
+                .shell(serial, "settings delete global http_proxy")
+                .await;
+        }
         "charles" => {
-            let host = settings.charles_host.trim();
-            if host.is_empty() {
-                return;
-            }
+            let host = match sanitize::validate_host(settings.charles_host.trim()) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
             let dest = format!("{host}:{}", settings.charles_port);
             let _ = adb
                 .shell(serial, &format!("settings put global http_proxy {dest}"))

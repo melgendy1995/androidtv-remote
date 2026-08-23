@@ -162,17 +162,67 @@ pub async fn start_proxy(
     Ok(bound)
 }
 
+const MAX_HTTP_MESSAGE: usize = 16 * 1024 * 1024;
+
+/// Read one full HTTP message (head + Content-Length body). A single
+/// `read()` call truncates requests that arrive across multiple TCP
+/// segments, so loop until the declared length is satisfied.
+async fn read_http_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut data: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut buf = vec![0u8; 8192];
+    let mut expected: Option<usize> = None;
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if data.len() > MAX_HTTP_MESSAGE {
+            break;
+        }
+        if expected.is_none() {
+            if let Some(head_end) = find_head_end(&data) {
+                let head = String::from_utf8_lossy(&data[..head_end]);
+                expected = Some(
+                    head_end
+                        + 4
+                        + header_value(&head, "content-length")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0),
+                );
+            }
+        }
+        if let Some(total) = expected {
+            if data.len() >= total {
+                break;
+            }
+        }
+    }
+    Ok(data)
+}
+
+fn find_head_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
 async fn handle_client(
     mut client: TcpStream,
     log: Arc<NetworkLog>,
     on_entry: Arc<dyn Fn(NetworkEntry) + Send + Sync>,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 8192];
-    let n = client.read(&mut buf).await?;
-    if n == 0 {
+    let raw = read_http_message(&mut client).await?;
+    if raw.is_empty() {
         return Ok(());
     }
-    let head = String::from_utf8_lossy(&buf[..n]);
+    let head_end = find_head_end(&raw).unwrap_or(raw.len());
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
     let first = head.lines().next().unwrap_or_default();
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
@@ -181,7 +231,7 @@ async fn handle_client(
     let started = chrono::Utc::now().timestamp_millis() as u64;
     if method == "CONNECT" {
         let host = target.clone();
-        let (request_headers, _) = parse_headers_and_body(&buf[..n]);
+        let (request_headers, _) = parse_headers_and_body(&raw);
         let entry = NetworkEntry {
             id: log.next_id(),
             started_at: started,
@@ -230,7 +280,7 @@ async fn handle_client(
     } else {
         format!("{host}:80")
     };
-    let (request_headers, request_body) = parse_headers_and_body(&buf[..n]);
+    let (request_headers, request_body) = parse_headers_and_body(&raw);
     let mut entry = NetworkEntry {
         id: log.next_id(),
         started_at: started,
@@ -250,14 +300,14 @@ async fn handle_client(
     on_entry(log.push(entry.clone()));
 
     let mut upstream = TcpStream::connect(&dest).await?;
-    let rewritten = rewrite_absolute_request(&head);
+    // Force connection close upstream so the response is EOF-delimited and
+    // read_to_end returns promptly instead of stalling on keep-alive.
+    let rewritten = rewrite_request_head(&head);
     upstream.write_all(rewritten.as_bytes()).await?;
-    if n == buf.len() {
-        let _ = tokio::io::copy(&mut client, &mut upstream).await;
-    }
+    upstream.write_all(&raw[head_end + 4..]).await?;
     let mut resp = Vec::new();
     let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
         upstream.read_to_end(&mut resp),
     )
     .await;
@@ -288,7 +338,9 @@ fn split_url(url: &str) -> (String, String) {
     }
 }
 
-fn rewrite_absolute_request(head: &str) -> String {
+/// Rewrite an absolute-form request head to origin-form and force
+/// `Connection: close` so upstream EOF-delimits the response.
+fn rewrite_request_head(head: &str) -> String {
     let mut lines = head.lines();
     let first = lines.next().unwrap_or_default();
     let mut parts = first.split_whitespace();
@@ -303,15 +355,19 @@ fn rewrite_absolute_request(head: &str) -> String {
     let mut out = format!("{method} {path} {ver}\r\n");
     for line in lines {
         if line.is_empty() {
-            out.push_str("\r\n");
             break;
+        }
+        if line
+            .split_once(':')
+            .map(|(k, _)| k.trim().eq_ignore_ascii_case("connection"))
+            .unwrap_or(false)
+        {
+            continue;
         }
         out.push_str(line);
         out.push_str("\r\n");
     }
-    if !out.ends_with("\r\n\r\n") {
-        out.push_str("\r\n");
-    }
+    out.push_str("Connection: close\r\n\r\n");
     out
 }
 
@@ -403,5 +459,26 @@ mod tests {
         let (headers, body) = parse_headers_and_body(raw);
         assert_eq!(headers.get("Host").map(String::as_str), Some("api.tv"));
         assert_eq!(body.as_deref(), Some("{\"u\":\"a\"}"));
+    }
+
+    #[test]
+    fn rewrites_absolute_head_and_forces_close() {
+        let head = "POST http://api.tv/v1/x HTTP/1.1\r\nHost: api.tv\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\n";
+        let out = rewrite_request_head(head);
+        assert!(out.starts_with("POST /v1/x HTTP/1.1\r\n"));
+        assert!(out.contains("Content-Length: 2\r\n"));
+        assert!(!out.contains("keep-alive"));
+        assert!(out.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn finds_head_end_and_content_length() {
+        let data = b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+        let end = find_head_end(data).unwrap();
+        assert_eq!(&data[end + 4..], b"hello");
+        assert_eq!(
+            header_value(&String::from_utf8_lossy(&data[..end]), "content-length"),
+            Some("5")
+        );
     }
 }

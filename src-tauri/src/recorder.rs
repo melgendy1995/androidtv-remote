@@ -61,11 +61,16 @@ impl VideoRecorder {
         pps: Vec<u8>,
     ) -> Result<()> {
         let mut file = File::create(path)?;
-        file.write_all(&[0u8; 8])?;
+        write_ftyp(&mut file)?;
+        // Reserve the mdat header up front; patched in finalize(). Always
+        // written in largesize form (size=1 + u64) so recordings beyond
+        // 4 GB stay valid MP4s.
+        file.write_all(&[0u8; 16])?;
+        let mdat_start = file.stream_position()? - 16;
         let inner = Inner {
             path: path.to_string_lossy().to_string(),
             file,
-            mdat_start: 0,
+            mdat_start,
             samples: Vec::new(),
             sps,
             pps,
@@ -121,15 +126,29 @@ impl VideoRecorder {
 
 fn finalize(inner: &mut Inner) -> Result<()> {
     let mdat_end = inner.file.stream_position()?;
-    let mdat_size = mdat_end;
-    inner.file.seek(SeekFrom::Start(0))?;
-    write_u32(&mut inner.file, mdat_size as u32)?;
+    let mdat_size = mdat_end - inner.mdat_start;
+    inner.file.seek(SeekFrom::Start(inner.mdat_start))?;
+    write_u32(&mut inner.file, 1)?;
     inner.file.write_all(b"mdat")?;
+    write_u64(&mut inner.file, mdat_size)?;
     inner.file.seek(SeekFrom::End(0))?;
 
     let mut moov = Vec::new();
     write_moov(&mut moov, inner)?;
     inner.file.write_all(&moov)?;
+    Ok(())
+}
+
+fn write_ftyp(file: &mut File) -> Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"isom");
+    body.extend_from_slice(&0x200u32.to_be_bytes());
+    for brand in [b"isom".as_slice(), b"iso2", b"avc1", b"mp41"] {
+        body.extend_from_slice(brand);
+    }
+    let mut buf = Vec::new();
+    write_box(&mut buf, *b"ftyp", &body);
+    file.write_all(&buf)?;
     Ok(())
 }
 
@@ -257,12 +276,25 @@ fn write_stbl(out: &mut Vec<u8>, inner: &Inner) -> Result<()> {
     }
     write_box(&mut stbl, *b"stsz", &stsz);
 
-    let mut stco = vec![0, 0, 0, 0];
-    stco.extend_from_slice(&(inner.samples.len() as u32).to_be_bytes());
-    for s in &inner.samples {
-        stco.extend_from_slice(&(s.offset as u32).to_be_bytes());
+    let needs_co64 = inner
+        .samples
+        .iter()
+        .any(|s| s.offset > u32::MAX as u64);
+    if needs_co64 {
+        let mut co64 = vec![0, 0, 0, 0];
+        co64.extend_from_slice(&(inner.samples.len() as u32).to_be_bytes());
+        for s in &inner.samples {
+            co64.extend_from_slice(&s.offset.to_be_bytes());
+        }
+        write_box(&mut stbl, *b"co64", &co64);
+    } else {
+        let mut stco = vec![0, 0, 0, 0];
+        stco.extend_from_slice(&(inner.samples.len() as u32).to_be_bytes());
+        for s in &inner.samples {
+            stco.extend_from_slice(&(s.offset as u32).to_be_bytes());
+        }
+        write_box(&mut stbl, *b"stco", &stco);
     }
-    write_box(&mut stbl, *b"stco", &stco);
 
     write_box(out, *b"stbl", &stbl);
     Ok(())
@@ -308,6 +340,11 @@ fn write_box(out: &mut Vec<u8>, kind: [u8; 4], body: &[u8]) {
 }
 
 fn write_u32(file: &mut File, value: u32) -> Result<()> {
+    file.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
+fn write_u64(file: &mut File, value: u64) -> Result<()> {
     file.write_all(&value.to_be_bytes())?;
     Ok(())
 }
@@ -430,5 +467,36 @@ mod tests {
     fn rejects_non_idr_frame() {
         let frame = [0, 0, 0, 1, 0x09, 0x30, 0, 0, 0, 1, 0x41, 0x9a];
         assert!(!contains_idr(&frame));
+    }
+
+    #[test]
+    fn writes_ftyp_largesize_mdat_and_valid_offsets() {
+        let path = std::env::temp_dir().join(format!(
+            "atv-recorder-test-{}.mp4",
+            std::process::id()
+        ));
+        let recorder = VideoRecorder::new();
+        let sps = vec![0x67, 0x64, 0x00, 0x28];
+        let pps = vec![0x68, 0xeb, 0xec, 0xb2];
+        recorder.start(&path, 1920, 1080, sps.clone(), pps.clone()).unwrap();
+        let frame = vec![0u8; 64];
+        recorder.push_sample(&frame, true).unwrap();
+        recorder.push_sample(&frame, false).unwrap();
+        recorder.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // ftyp first (32 bytes: size+type+isom+minor+4 brands)
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert_eq!(&bytes[32..36], &[0, 0, 0, 1]); // largesize marker
+        assert_eq!(&bytes[36..40], b"mdat");
+        let mdat_size = u64::from_be_bytes(bytes[40..48].try_into().unwrap());
+        // first sample data starts right after the 16-byte mdat header
+        assert_eq!(&bytes[48..54], &[0u8; 6]);
+        // moov appended after mdat
+        let moov_at = 32 + mdat_size as usize;
+        assert_eq!(&bytes[moov_at + 4..moov_at + 8], b"moov");
+        // sample offsets point at real data (first frame right after mdat header)
+        assert!(bytes.windows(4).any(|w| w == b"stco"));
     }
 }

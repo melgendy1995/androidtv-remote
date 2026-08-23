@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::adb::{parse_devices, AdbClient, ListedDevice};
 use crate::error::Result;
-use crate::paths::{devices_path, ensure_dir};
+use crate::paths::{devices_path, ensure_parent_dir};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,7 +69,7 @@ impl DeviceRegistry {
 
     fn persist(&self) -> Result<()> {
         let path = devices_path();
-        ensure_dir(&path)?;
+        ensure_parent_dir(&path)?;
         let list: Vec<&SavedDevice> = self.saved.values().collect();
         std::fs::write(&path, serde_json::to_vec_pretty(&list)?)?;
         #[cfg(unix)]

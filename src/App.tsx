@@ -139,8 +139,6 @@ export default function App() {
       unsubs.push(u);
     };
     add<ConnectionStatus>("status", setStatus);
-    add<NowPlaying>("now-playing", setNow);
-    add<KeyboardState>("keyboard", setKeyboard);
     add<StreamStatus>("stream", setStream);
     add<RecordingStatus>("recording", setRecording);
     add<LogLine>("logcat", (line) => {
@@ -645,8 +643,9 @@ export default function App() {
             setPairError(undefined);
             try {
               await api.pairWireless(host, code);
-              const base = host.split(":")[0];
-              await api.connectHost(`${base}:5555`);
+              // Android 11+ wireless debugging uses a RANDOM connect port —
+              // the backend discovers it via mdns/devices instead of :5555.
+              await api.connectAfterPair(host.split(":")[0]);
               await scan();
               await refreshStatus();
               setSheet(null);
