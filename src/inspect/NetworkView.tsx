@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import type { NetworkEntry } from "../types";
 
 function JsonSyntaxViewer({ data }: { data: any }) {
@@ -65,7 +65,10 @@ function JsonSyntaxViewer({ data }: { data: any }) {
   );
 }
 
-function getStatusBadge(status?: number, encrypted?: boolean) {
+function getStatusBadge(status?: number, encrypted?: boolean, tlsError?: string) {
+  if (tlsError) {
+    return { fg: "#ff453a", bg: "rgba(255,69,58,0.3)", label: "Decrypt Failed" };
+  }
   if (status == null) {
     if (encrypted) {
       return { fg: "#64d2ff", bg: "rgba(100,210,255,0.15)", label: "TLS Encrypted" };
@@ -151,13 +154,40 @@ export function NetworkView({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | "errors" | "success">("all");
   const [query, setQuery] = useState("");
+  const [hideFailedTunnels, setHideFailedTunnels] = useState(true);
+  const [autoScroll, setAutoScroll] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
 
+  // Manual scroll up pauses following until the user returns to the bottom.
+  const handleScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  // CONNECT rows are tunnel scaffolding: hide them once real decrypted
+  // requests exist for that host so the list shows the actual APIs. Keep
+  // failed/opaque tunnels visible as explicit decrypt errors — unless muted.
   const filteredEntries = useMemo(() => {
+    const decryptedHosts = new Set(
+      (entries || [])
+        .filter((e) => (e.method || "").toUpperCase() !== "CONNECT" && e.encrypted)
+        .map((e) => e.host)
+    );
     const q = query.toLowerCase().trim();
     return (entries || []).filter((e) => {
+      if (hideFailedTunnels && e.tlsError) return false;
+      if (
+        (e.method || "").toUpperCase() === "CONNECT" &&
+        !e.tlsError &&
+        decryptedHosts.has(e.host)
+      ) {
+        return false;
+      }
       const isFailed = (e.status && e.status >= 400) || (!e.encrypted && e.status == null);
-      if (filter === "errors" && !isFailed) return false;
-      if (filter === "success" && (isFailed || (e.status && e.status >= 400))) return false;
+      if (filter === "errors" && !(isFailed || e.tlsError)) return false;
+      if (filter === "success" && ((e.status && e.status >= 400) || e.tlsError)) return false;
 
       if (q) {
         const full = `${e.method || ""} ${displayUrl(e)} ${e.host || ""} ${e.path || ""} ${e.status || ""}`.toLowerCase();
@@ -165,7 +195,15 @@ export function NetworkView({
       }
       return true;
     });
-  }, [entries, filter, query]);
+  }, [entries, filter, query, hideFailedTunnels]);
+
+  // Follow the tail while auto-scroll is enabled and the user is at the bottom.
+  useEffect(() => {
+    if (!autoScroll || !stickToBottom.current) return;
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [filteredEntries.length, autoScroll]);
 
   const selectedRow = entries.find((e) => e.id === selectedId);
 
@@ -213,6 +251,51 @@ export function NetworkView({
             ))}
           </div>
 
+          <label
+            title="Hide rows for tunnels whose TLS could not be decrypted (system calls, pinned apps)"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              fontSize: 11,
+              color: "var(--muted)",
+              cursor: "pointer",
+              userSelect: "none",
+              whiteSpace: "nowrap",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={hideFailedTunnels}
+              onChange={(e) => setHideFailedTunnels(e.target.checked)}
+            />
+            Hide failed tunnels
+          </label>
+
+          <label
+            title="Automatically scroll to the newest request"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              fontSize: 11,
+              color: "var(--muted)",
+              cursor: "pointer",
+              userSelect: "none",
+              whiteSpace: "nowrap",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={autoScroll}
+              onChange={(e) => {
+                setAutoScroll(e.target.checked);
+                stickToBottom.current = true;
+              }}
+            />
+            Auto-scroll
+          </label>
+
           <button className="surface-btn" style={{ width: "auto", padding: "4px 8px", fontSize: 11 }} onClick={onClear}>
             🗑 Clear
           </button>
@@ -222,11 +305,17 @@ export function NetworkView({
         </div>
 
         {/* Requests Table Body */}
-        <div className="inspect-body" style={{ flex: 1, overflowY: "auto", padding: "4px 0" }}>
+        <div
+          className="inspect-body"
+          ref={listRef}
+          onScroll={handleScroll}
+          style={{ flex: 1, overflowY: "auto", padding: "4px 0" }}
+        >
           {filteredEntries.map((e, idx) => {
-            const badge = getStatusBadge(e.status, e.encrypted);
+            const badge = getStatusBadge(e.status, e.encrypted, e.tlsError);
             const methodColor = getMethodColor(e.method);
-            const isFailed = (e.status && e.status >= 400) || (!e.encrypted && e.status == null);
+            const isFailed =
+              (e.status && e.status >= 400) || (!e.encrypted && e.status == null) || !!e.tlsError;
             const isSelected = selectedId === e.id;
 
             return (
@@ -314,10 +403,9 @@ function RequestDetail({
   onClose: () => void;
 }) {
   const [pane, setPane] = useState<"request" | "response" | "query">("request");
-  const badge = getStatusBadge(entry.status, entry.encrypted);
+  const badge = getStatusBadge(entry.status, entry.encrypted, entry.tlsError);
   const url = entryUrl(entry);
   const params = queryParams(url);
-  const source = capturedFrom(entry);
 
   return (
     <div
@@ -358,8 +446,8 @@ function RequestDetail({
               path {entry.path}
             </div>
           ) : null}
-          {source ? (
-            <div style={{ color: "#64d2ff", marginTop: 4 }}>{source}</div>
+          {capturedFrom(entry) ? (
+            <div style={{ color: "#64d2ff", marginTop: 4 }}>{capturedFrom(entry)}</div>
           ) : null}
         </div>
         <button className="icon-btn" style={{ width: 22, height: 22, flexShrink: 0 }} onClick={onClose}>
@@ -368,6 +456,25 @@ function RequestDetail({
       </div>
 
       <div>
+        {entry.tlsError ? (
+          <div
+            style={{
+              color: "#ff453a",
+              background: "rgba(255,69,58,0.12)",
+              border: "1px solid rgba(255,69,58,0.4)",
+              borderRadius: 8,
+              padding: "6px 10px",
+              marginBottom: 8,
+              wordBreak: "break-word",
+              lineHeight: 1.45,
+            }}
+          >
+            TLS decrypt failed — traffic not captured.
+            {entry.tlsError.includes("certificate_unknown") || entry.tlsError.includes("CertificateUnknown")
+              ? " The TV rejected our MITM certificate (certificate_unknown): the app is certificate-pinned, or the MITM CA is not trusted by this build."
+              : ""}
+          </div>
+        ) : null}
         <span
           style={{
             fontSize: 11,
@@ -421,8 +528,10 @@ function RequestDetail({
             title="Request body"
             body={entry.requestBody}
             empty={
-              (entry.method || "").toUpperCase() === "CONNECT" || (entry.encrypted && !source)
-                ? "HTTPS tunnel — path/body are inside TLS. Full URLs also appear here when the app logs them (OkHttp)."
+              entry.tlsError
+                ? "TLS tunnel could not be decrypted."
+                : (entry.method || "").toUpperCase() === "CONNECT"
+                ? "Tunnel row — open a decrypted request below the same host for path/body."
                 : "No request body."
             }
           />
@@ -434,8 +543,10 @@ function RequestDetail({
             title="Response body"
             body={entry.responseBody}
             empty={
-              (entry.method || "").toUpperCase() === "CONNECT" || (entry.encrypted && !source)
-                ? "HTTPS tunnel — response body is encrypted."
+              entry.tlsError
+                ? "TLS tunnel could not be decrypted."
+                : (entry.method || "").toUpperCase() === "CONNECT"
+                ? "Tunnel row — open a decrypted request below the same host."
                 : "No response body."
             }
           />

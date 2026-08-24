@@ -40,6 +40,7 @@ export function InspectDrawer({
   crashes: {
     entries: CrashEntry[];
     onSave: (id: string) => void;
+    onClear: () => void;
   };
 }) {
   const [height, setHeight] = useState(360);

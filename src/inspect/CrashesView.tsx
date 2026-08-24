@@ -4,9 +4,11 @@ import type { CrashEntry } from "../types";
 export function CrashesView({
   entries,
   onSave,
+  onClear,
 }: {
   entries: CrashEntry[];
   onSave: (id: string) => void;
+  onClear: () => void;
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
@@ -16,6 +18,22 @@ export function CrashesView({
 
   return (
     <div className="inspect-body" style={{ fontFamily: "inherit", padding: "4px 0" }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "flex-end",
+          padding: "6px 12px",
+          borderBottom: "1px solid var(--border)",
+        }}
+      >
+        <button
+          className="surface-btn"
+          style={{ width: "auto", padding: "4px 10px", fontSize: 11 }}
+          onClick={onClear}
+        >
+          🗑 Clear ({entries.length})
+        </button>
+      </div>
       {entries.map((c) => {
         const hidden = !!collapsed[c.id];
         return (

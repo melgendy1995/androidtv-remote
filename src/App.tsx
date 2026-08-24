@@ -603,6 +603,9 @@ export default function App() {
               onSave: (id) => {
                 api.saveCrash(id).then((p) => api.reveal(p)).catch((e) => setCaptureError(String(e)));
               },
+              onClear: () => {
+                api.clearCrashes().then(() => setCrashes([])).catch(() => undefined);
+              },
             }}
           />
         }

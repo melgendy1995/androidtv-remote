@@ -91,6 +91,7 @@ export type NetworkEntry = {
   durationMs?: number;
   size?: number;
   encrypted: boolean;
+  tlsError?: string;
   requestHeaders: Record<string, string>;
   responseHeaders: Record<string, string>;
   requestBody?: string;

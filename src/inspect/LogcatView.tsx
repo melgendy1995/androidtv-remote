@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { LogLevel, LogLine } from "../types";
 
@@ -54,6 +54,17 @@ export function LogcatView({
 }) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [selectedLine, setSelectedLine] = useState<LogLine | null>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const stickToBottom = useRef(true);
+
+  // Track manual scrolling: if the user scrolls up, stop following until they
+  // return to the bottom (or re-enable the checkbox).
+  const handleScroll = () => {
+    const el = parentRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    stickToBottom.current = atBottom;
+  };
 
   const filtered = useMemo(() => {
     const min = LEVELS.indexOf(level);
@@ -81,6 +92,14 @@ export function LogcatView({
     overscan: 20,
     measureElement: (el) => el.getBoundingClientRect().height,
   });
+
+  // Follow the tail while auto-scroll is enabled and the user is at the bottom.
+  useEffect(() => {
+    if (!autoScroll || !stickToBottom.current) return;
+    const el = parentRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [filtered.length, autoScroll]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
@@ -136,6 +155,30 @@ export function LogcatView({
           <option value="net.intigral.jawwytv">Jawwy</option>
         </select>
 
+        <label
+          title="Automatically scroll to the newest log line"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            fontSize: 12,
+            color: "var(--muted)",
+            cursor: "pointer",
+            userSelect: "none",
+            whiteSpace: "nowrap",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={autoScroll}
+            onChange={(e) => {
+              setAutoScroll(e.target.checked);
+              stickToBottom.current = true;
+            }}
+          />
+          Auto-scroll
+        </label>
+
         <button
           className="surface-btn"
           style={{
@@ -167,7 +210,7 @@ export function LogcatView({
 
       {/* Main Colorful Virtualized Log Table & Inspector */}
       <div style={{ display: "flex", flex: 1, minHeight: 0, position: "relative" }}>
-        <div className="inspect-body" ref={parentRef} style={{ flex: 1, minWidth: 0, padding: "4px 0" }}>
+        <div className="inspect-body" ref={parentRef} onScroll={handleScroll} style={{ flex: 1, minWidth: 0, padding: "4px 0" }}>
           <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
             {virtualizer.getVirtualItems().map((v) => {
               const l = filtered[v.index];

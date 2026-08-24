@@ -46,6 +46,7 @@ export const api = {
   exportLogcat: () => invoke<string>("export_logcat"),
   listCrashes: () => invoke<CrashEntry[]>("list_crashes"),
   saveCrash: (id: string) => invoke<string>("save_crash", { id }),
+  clearCrashes: () => invoke<void>("clear_crashes"),
   startProxy: () => invoke<number>("start_proxy"),
   stopProxy: () => invoke<void>("stop_proxy"),
   clearNetwork: () => invoke<void>("clear_network"),
