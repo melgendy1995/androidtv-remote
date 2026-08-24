@@ -28,3 +28,15 @@ bytes = "1"
 base64 = "0.22"
 which = "7"
 tauri-plugin-dialog = "2.7.2"
+# TLS MITM (built-in proxy): terminate the TV's CONNECT tunnel and forward
+# over a normal TLS client connection.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+flate2 = "1"
+time = "0.3"
+p12-keystore = "0.3.1"

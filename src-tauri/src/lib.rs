@@ -7,6 +7,7 @@ mod error;
 mod files;
 mod keys;
 mod logcat;
+mod mitm_ca;
 mod paths;
 mod proxy;
 mod recorder;
@@ -709,6 +710,7 @@ async fn restart_logcat(app: AppHandle, state: &AppState, serial: String) {
                             duration_ms: http.duration_ms,
                             size: None,
                             encrypted: http.encrypted,
+                            tls_error: None,
                             request_headers: headers,
                             response_headers: Default::default(),
                             request_body: None,
@@ -810,6 +812,12 @@ async fn save_crash(state: State<'_, Arc<AppState>>, id: String) -> Result<Strin
 }
 
 #[tauri::command]
+async fn clear_crashes(state: State<'_, Arc<AppState>>) -> Result<()> {
+    state.crashes.clear();
+    Ok(())
+}
+
+#[tauri::command]
 async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<u16> {
     start_proxy_inner(&app, &state).await
 }
@@ -817,8 +825,19 @@ async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
 async fn start_proxy_inner(app: &AppHandle, state: &AppState) -> Result<u16> {
     let port = state.settings.lock().await.proxy_port;
     let log = state.network.clone();
+    // Resolve the MITM CA (2018 Charles p12 → cached PEMs → generated).
+    let mut extra = vec![state.resource_dir.clone()];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            extra.push(parent.to_path_buf());
+        }
+    }
+    let ca = tokio::task::spawn_blocking(move || mitm_ca::MitmCa::resolve(&extra))
+        .await
+        .map_err(|e| AppError::Msg(format!("mitm ca task: {e}")))?
+        .map_err(AppError::Msg)?;
     let app2 = app.clone();
-    let bound = proxy::start_proxy(port, log, move |entry| {
+    let bound = proxy::start_proxy(port, log, ca, move |entry| {
         let _ = app2.emit("network", entry);
     })
     .await?;
@@ -841,13 +860,7 @@ async fn stop_proxy_inner(state: &AppState) {
     // be left configured on the TV.
     if let Ok(serial) = current_serial(state).await {
         let adb = state.adb.lock().await.clone();
-        let _ = adb.shell(&serial, "settings delete global http_proxy").await;
-        let _ = adb
-            .shell(&serial, "settings delete global global_http_proxy_host")
-            .await;
-        let _ = adb
-            .shell(&serial, "settings delete global global_http_proxy_port")
-            .await;
+        clear_device_proxy(&adb, &serial).await;
         remove_proxy_reverse(&adb, &serial, state).await;
     }
     *state.proxy_port.lock().await = None;
@@ -1143,6 +1156,7 @@ pub fn run() {
             export_logcat,
             list_crashes,
             save_crash,
+            clear_crashes,
             start_proxy,
             stop_proxy,
             clear_network,
@@ -1197,13 +1211,7 @@ async fn teardown_session(state: &AppState, serial: Option<&str>) {
         let adb = state.adb.lock().await.clone();
         // Always clear the device proxy — Charles mode included — or a killed
         // app leaves the TV pointing at a dead proxy with no internet.
-        let _ = adb.shell(serial, "settings delete global http_proxy").await;
-        let _ = adb
-            .shell(serial, "settings delete global global_http_proxy_host")
-            .await;
-        let _ = adb
-            .shell(serial, "settings delete global global_http_proxy_port")
-            .await;
+        clear_device_proxy(&adb, serial).await;
         remove_proxy_reverse(&adb, serial, state).await;
         if serial.contains(':') {
             let _ = adb.disconnect(serial).await;
@@ -1215,16 +1223,24 @@ async fn teardown_session(state: &AppState, serial: Option<&str>) {
     }
 }
 
+async fn clear_device_proxy(adb: &AdbClient, serial: &str) {
+    let _ = adb.shell(serial, "settings delete global http_proxy").await;
+    let _ = adb
+        .shell(serial, "settings delete global global_http_proxy_host")
+        .await;
+    let _ = adb
+        .shell(serial, "settings delete global global_http_proxy_port")
+        .await;
+}
+
 async fn attach_inspect_proxy(adb: &AdbClient, serial: &str, state: &AppState) {
     let settings = state.settings.lock().await.clone();
+    // Always wipe leftover Charles / inspect keys first. The TV Settings UI
+    // shows global_http_proxy_host:port; built-in used to only overwrite
+    // http_proxy, so the screen still said "Charles".
+    clear_device_proxy(adb, serial).await;
     match settings.device_proxy_mode.as_str() {
-        // Re-apply (clear) on every connect so leftovers from a previous
-        // session or mode can't strand the TV behind a dead proxy.
-        "off" => {
-            let _ = adb
-                .shell(serial, "settings delete global http_proxy")
-                .await;
-        }
+        "off" => {}
         "charles" => {
             let host = match sanitize::validate_host(settings.charles_host.trim()) {
                 Ok(h) => h,
@@ -1263,6 +1279,15 @@ async fn attach_inspect_proxy(adb: &AdbClient, serial: &str, state: &AppState) {
                 .shell(
                     serial,
                     &format!("settings put global http_proxy 127.0.0.1:{port}"),
+                )
+                .await;
+            let _ = adb
+                .shell(serial, "settings put global global_http_proxy_host 127.0.0.1")
+                .await;
+            let _ = adb
+                .shell(
+                    serial,
+                    &format!("settings put global global_http_proxy_port {port}"),
                 )
                 .await;
         }

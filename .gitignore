@@ -19,6 +19,7 @@ src-tauri/resources/AdbWinApi.dll
 src-tauri/resources/AdbWinUsbApi.dll
 src-tauri/resources/adb-*
 src-tauri/resources/scrcpy-server
+src-tauri/resources/mitm/
 !src-tauri/resources/.gitkeep
 
 # Editor directories and files

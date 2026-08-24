@@ -29,6 +29,22 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Embed MITM CA (2018 Charles p12 PEMs from repo secrets)
+        shell: bash
+        env:
+          MITM_CA_PEM: ${{ secrets.MITM_CA_PEM }}
+          MITM_CA_KEY: ${{ secrets.MITM_CA_KEY }}
+        run: |
+          mkdir -p src-tauri/resources/mitm
+          if [ -n "$MITM_CA_PEM" ] && [ -n "$MITM_CA_KEY" ]; then
+            printf '%s\n' "$MITM_CA_PEM" > src-tauri/resources/mitm/ca.pem
+            printf '%s\n' "$MITM_CA_KEY" > src-tauri/resources/mitm/ca-key.pem
+            printf '%s\n' "charles-2018-p12" > src-tauri/resources/mitm/source
+            echo "Embedded MITM CA for Windows installer"
+          else
+            echo "No MITM_CA_* secrets — installer will generate an untrusted CA at runtime"
+          fi
+
       - name: Install frontend
         run: npm ci
 
