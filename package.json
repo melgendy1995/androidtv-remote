@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "sidecars": "node scripts/fetch-sidecars.mjs",
+    "build:macos": "node scripts/fetch-sidecars.mjs && tauri build --target universal-apple-darwin --bundles app",
     "build:windows": "node scripts/fetch-sidecars.mjs && tauri build --bundles nsis"
   },
   "dependencies": {

@@ -1,0 +1,86 @@
+name: macOS app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Embed MITM CA (2018 Charles p12 PEMs from repo secrets)
+        env:
+          MITM_CA_PEM: ${{ secrets.MITM_CA_PEM }}
+          MITM_CA_KEY: ${{ secrets.MITM_CA_KEY }}
+        run: |
+          mkdir -p src-tauri/resources/mitm
+          if [ -n "$MITM_CA_PEM" ] && [ -n "$MITM_CA_KEY" ]; then
+            printf '%s\n' "$MITM_CA_PEM" > src-tauri/resources/mitm/ca.pem
+            printf '%s\n' "$MITM_CA_KEY" > src-tauri/resources/mitm/ca-key.pem
+            printf '%s\n' "charles-2018-p12" > src-tauri/resources/mitm/source
+            echo "Embedded MITM CA for macOS app"
+          else
+            echo "No MITM_CA_* secrets — app will generate an untrusted CA at runtime"
+          fi
+
+      - name: Install frontend
+        run: npm ci
+
+      - name: Fetch ADB + scrcpy sidecars
+        run: npm run sidecars
+
+      - name: Build universal .app
+        run: npm run tauri -- build --target universal-apple-darwin --bundles app
+
+      - name: Stage shareable .app
+        run: |
+          set -euo pipefail
+          APP=$(find src-tauri/target -path '*/bundle/macos/*.app' -type d | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "No .app bundle found under src-tauri/target"
+            find src-tauri/target -name '*.app' -o -path '*/bundle/*' | head -n 50
+            exit 1
+          fi
+          echo "Found $APP"
+          mkdir -p dist-mac
+          ditto "$APP" "dist-mac/Android TV Remote.app"
+          ditto -c -k --keepParent "dist-mac/Android TV Remote.app" "Android TV Remote.app.zip"
+          ls -lh dist-mac "Android TV Remote.app.zip"
+
+      - name: Upload .app
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidTVRemote-macos
+          # Upload the parent folder so the zip contains Android TV Remote.app/,
+          # not a bare Contents/ tree.
+          path: dist-mac
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach .app zip to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Android TV Remote.app.zip
+          generate_release_notes: true
