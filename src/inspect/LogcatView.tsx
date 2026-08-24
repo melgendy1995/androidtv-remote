@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { LogLevel, LogLine } from "../types";
+import { copyText } from "../utils/clipboard";
 
 const LEVELS: LogLevel[] = ["V", "D", "I", "W", "E", "F"];
 
@@ -54,6 +55,7 @@ export function LogcatView({
 }) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [selectedLine, setSelectedLine] = useState<LogLine | null>(null);
+  const [copiedId, setCopiedId] = useState<number | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const stickToBottom = useRef(true);
 
@@ -353,6 +355,8 @@ export function LogcatView({
                   resize: "none",
                   whiteSpace: "pre-wrap",
                   wordBreak: "break-word",
+                  userSelect: "text",
+                  cursor: "text",
                 }}
               />
             </div>
@@ -369,29 +373,34 @@ export function LogcatView({
                     background: "#060608",
                     border: "1px solid var(--border)",
                     borderRadius: 8,
-                    fontSize: 10,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    maxHeight: 120,
-                    overflow: "auto",
-                  }}
-                >
-                  {selectedLine.raw}
+                  fontSize: 10,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                  maxHeight: 120,
+                  overflow: "auto",
+                  userSelect: "text",
+                  cursor: "text",
+                }}
+              >
+                {selectedLine.raw}
                 </pre>
               </div>
             ) : null}
 
             <button
               className="surface-btn"
-              style={{ fontSize: 12, padding: "6px 10px" }}
-              onClick={() => {
-                navigator.clipboard.writeText(
+              style={{ fontSize: 12, padding: "6px 10px", color: copiedId === selectedLine.id ? "#30d158" : "inherit", fontWeight: copiedId === selectedLine.id ? 700 : 400 }}
+              onClick={async () => {
+                const text =
                   selectedLine.raw ||
-                    `[${selectedLine.time}] ${selectedLine.level}/${selectedLine.tag}(${selectedLine.pid}): ${selectedLine.message}`
-                );
+                  `[${selectedLine.time}] ${selectedLine.level}/${selectedLine.tag}(${selectedLine.pid}): ${selectedLine.message}`;
+                if (await copyText(text)) {
+                  setCopiedId(selectedLine.id);
+                  window.setTimeout(() => setCopiedId(null), 1200);
+                }
               }}
             >
-              📋 Copy Log Line
+              {copiedId === selectedLine.id ? "✓ Copied" : "📋 Copy Log Line"}
             </button>
           </div>
         ) : null}

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { CrashEntry } from "../types";
+import { copyText } from "../utils/clipboard";
 
 export function CrashesView({
   entries,
@@ -11,6 +12,15 @@ export function CrashesView({
   onClear: () => void;
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const copyCrash = async (c: CrashEntry, kind: "full" | "stack") => {
+    const text = kind === "stack" ? c.stack : formatCrash(c);
+    if (text && (await copyText(text))) {
+      setCopiedKey(`${c.id}:${kind}`);
+      window.setTimeout(() => setCopiedKey(null), 1200);
+    }
+  };
 
   if (entries.length === 0) {
     return <p className="hint" style={{ padding: 12 }}>No crashes or ANRs captured this session.</p>;
@@ -60,10 +70,15 @@ export function CrashesView({
               </button>
               <button
                 className="surface-btn"
-                style={{ width: "auto", padding: "2px 8px" }}
-                onClick={() => navigator.clipboard.writeText(formatCrash(c))}
+                style={{
+                  width: "auto",
+                  padding: "2px 8px",
+                  color: copiedKey === `${c.id}:full` ? "#30d158" : "inherit",
+                  fontWeight: copiedKey === `${c.id}:full` ? 700 : 400,
+                }}
+                onClick={() => copyCrash(c, "full")}
               >
-                Copy
+                {copiedKey === `${c.id}:full` ? "✓ Copied" : "Copy"}
               </button>
             </div>
             {c.exception ? (
@@ -81,6 +96,22 @@ export function CrashesView({
             >
               {hidden ? "Show stack" : "Hide stack"}
             </button>
+            {!hidden && c.stack ? (
+              <button
+                className="surface-btn"
+                style={{
+                  width: "auto",
+                  padding: "2px 8px",
+                  marginLeft: 6,
+                  fontSize: 11,
+                  color: copiedKey === `${c.id}:stack` ? "#30d158" : "inherit",
+                  fontWeight: copiedKey === `${c.id}:stack` ? 700 : 400,
+                }}
+                onClick={() => copyCrash(c, "stack")}
+              >
+                {copiedKey === `${c.id}:stack` ? "✓ Copied" : "⧉ Copy stack"}
+              </button>
+            ) : null}
             {hidden ? null : (
               <pre
                 style={{
@@ -94,6 +125,8 @@ export function CrashesView({
                   borderRadius: 8,
                   maxHeight: "50vh",
                   overflow: "auto",
+                  userSelect: "text",
+                  cursor: "text",
                 }}
               >
                 {c.stack || "(no stack captured)"}

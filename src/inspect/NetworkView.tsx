@@ -1,5 +1,6 @@
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import type { NetworkEntry } from "../types";
+import { copyText } from "../utils/clipboard";
 
 function JsonSyntaxViewer({ data }: { data: any }) {
   const jsonStr = useMemo(() => {
@@ -22,7 +23,7 @@ function JsonSyntaxViewer({ data }: { data: any }) {
       .replace(/>/g, "&gt;");
 
     return escaped.replace(
-      /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+      /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE]+\d+)?)/g,
       (match) => {
         let color = "#ffd60a"; // number
         let weight = 400;
@@ -37,7 +38,7 @@ function JsonSyntaxViewer({ data }: { data: any }) {
         } else if (/true|false/.test(match)) {
           color = "#bf5af2"; // boolean
         } else if (/null/.test(match)) {
-          color = "#ff453a"; // null
+          color = "#ff453a";
         }
 
         return `<span style="color: ${color}; font-weight: ${weight}">${match}</span>`;
@@ -57,8 +58,10 @@ function JsonSyntaxViewer({ data }: { data: any }) {
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
         whiteSpace: "pre-wrap",
         wordBreak: "break-all",
-        maxHeight: 420,
+        maxHeight: "none",
         overflowY: "auto",
+        userSelect: "text",
+        cursor: "text",
       }}
       dangerouslySetInnerHTML={{ __html: htmlContent }}
     />
@@ -141,6 +144,227 @@ function getMethodColor(method?: string) {
       return "#8e8e93";
   }
 }
+
+/* ---------------------------------- Copy ---------------------------------- */
+
+function CopyButton({
+  getText,
+  label,
+  compact,
+}: {
+  getText: () => string;
+  label: string;
+  compact?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  return (
+    <button
+      className="surface-btn"
+      title={`Copy ${label.toLowerCase()} (⌘/Ctrl+C copies selection or ${label})`}
+      onClick={async (e) => {
+        e.stopPropagation();
+        if (await copyText(getText())) {
+          setCopied(true);
+          window.clearTimeout(timer.current);
+          timer.current = window.setTimeout(() => setCopied(false), 1200);
+        }
+      }}
+      style={{
+        width: "auto",
+        padding: compact ? "1px 6px" : "3px 8px",
+        fontSize: compact ? 10 : 11,
+        color: copied ? "#30d158" : "inherit",
+        fontWeight: copied ? 700 : 400,
+        flexShrink: 0,
+      }}
+    >
+      {copied ? "✓ Copied" : `⧉ ${label}`}
+    </button>
+  );
+}
+
+function headersToText(headers?: Record<string, string>) {
+  return Object.entries(headers || {})
+    .map(([name, value]) => `${name}: ${value}`)
+    .join("\n");
+}
+
+function buildFullDump(entry: NetworkEntry): string {
+  const url = entryUrl(entry);
+  const params = queryParams(url);
+  const lines: string[] = [
+    `${entry.method} ${url}`,
+    `Status: ${entry.status ?? "—"} · ${entry.durationMs ?? "—"} ms · ${entry.size ?? "—"} B`,
+    "",
+  ];
+  if (params.length) {
+    lines.push("== Query params ==", params.map(([k, v]) => `${k}=${v}`).join("\n"), "");
+  }
+  lines.push("== Request headers ==", headersToText(entry.requestHeaders) || "(none)", "");
+  lines.push(
+    "== Request body ==",
+    entry.requestBody ?? "(none)",
+    "",
+    "== Response headers ==",
+    headersToText(entry.responseHeaders) || "(none)",
+    ""
+  );
+  lines.push("== Response body ==", entry.responseBody ?? "(none)");
+  if (entry.tlsError) lines.unshift(`TLS error: ${entry.tlsError}`, "");
+  return lines.join("\n");
+}
+
+/* ------------------------------ Collapsible UI ----------------------------- */
+
+function Section({
+  id,
+  title,
+  openMap,
+  toggle,
+  actions,
+  children,
+}: {
+  id: string;
+  title: string;
+  openMap: Record<string, boolean>;
+  toggle: (id: string) => void;
+  actions?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  const open = openMap[id] !== false;
+  return (
+    <div
+      style={{
+        border: "1px solid var(--border)",
+        borderRadius: 8,
+        background: "rgba(255,255,255,0.015)",
+      }}
+    >
+      <div
+        onClick={() => toggle(id)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "5px 8px",
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+      >
+        <span style={{ color: "var(--muted)", fontSize: 10 }}>{open ? "▾" : "▸"}</span>
+        <span style={{ color: "var(--muted)", fontSize: 10, textTransform: "uppercase", fontWeight: 700, flex: 1 }}>
+          {title}
+        </span>
+        <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", gap: 4 }}>
+          {actions}
+        </div>
+      </div>
+      {open ? (
+        <div style={{ padding: "0 8px 8px" }}>{children}</div>
+      ) : null}
+    </div>
+  );
+}
+
+function BodyViewer({ body }: { body: string }) {
+  const [pretty, setPretty] = useState(true);
+  const [wrap, setWrap] = useState(true);
+  const isJson = useMemo(() => {
+    try {
+      JSON.parse(body);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [body]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", gap: 10 }}>
+        {isJson ? (
+          <label style={{ display: "inline-flex", gap: 4, alignItems: "center", fontSize: 10, color: "var(--muted)", cursor: "pointer" }}>
+            <input type="checkbox" checked={pretty} onChange={(e) => setPretty(e.target.checked)} /> Pretty JSON
+          </label>
+        ) : null}
+        <label style={{ display: "inline-flex", gap: 4, alignItems: "center", fontSize: 10, color: "var(--muted)", cursor: "pointer" }}>
+          <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> Wrap
+        </label>
+      </div>
+      {isJson && pretty ? (
+        <JsonSyntaxViewer data={body} />
+      ) : (
+        <pre
+          style={{
+            margin: 0,
+            padding: 10,
+            borderRadius: 8,
+            background: "#060608",
+            border: "1px solid var(--border)",
+            fontSize: 11,
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            whiteSpace: wrap ? "pre-wrap" : "pre",
+            wordBreak: wrap ? "break-all" : "normal",
+            overflowX: wrap ? "hidden" : "auto",
+            overflowY: "auto",
+            maxHeight: "none",
+            userSelect: "text",
+            cursor: "text",
+          }}
+        >
+          {body}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function HeaderTable({
+  headers,
+}: {
+  headers?: Record<string, string>;
+}) {
+  const rows = Object.entries(headers || {});
+  return (
+    <div>
+      {rows.length === 0 ? (
+        <div style={{ color: "var(--muted)" }}>None captured.</div>
+      ) : (
+        <div
+          style={{
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            overflow: "hidden",
+          }}
+        >
+          {rows.map(([name, value]) => (
+            <div
+              key={name}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "140px 1fr",
+                gap: 8,
+                padding: "5px 8px",
+                borderBottom: "1px solid rgba(255,255,255,0.04)",
+                wordBreak: "break-all",
+                userSelect: "text",
+                cursor: "text",
+              }}
+            >
+              <span style={{ color: "#64d2ff", fontWeight: 600 }}>{name}</span>
+              <span>{value}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------- Main views -------------------------------- */
 
 export function NetworkView({
   entries,
@@ -387,13 +611,20 @@ export function NetworkView({
         </div>
       </div>
 
-      {/* Selected Request Detail Panel with Color-Coded JSON Syntax Viewer */}
-      {selectedRow ? (
-        <RequestDetail entry={selectedRow} onClose={() => setSelectedId(null)} />
-      ) : null}
+      {/* Selected Request Detail Panel */}
+      {selectedRow ? <RequestDetail entry={selectedRow} onClose={() => setSelectedId(null)} /> : null}
     </div>
   );
 }
+
+const DEFAULT_OPEN_SECTIONS: Record<string, boolean> = {
+  overview: true,
+  url: true,
+  requestHeaders: false,
+  requestBody: true,
+  responseHeaders: false,
+  responseBody: true,
+};
 
 function RequestDetail({
   entry,
@@ -402,26 +633,96 @@ function RequestDetail({
   entry: NetworkEntry;
   onClose: () => void;
 }) {
-  const [pane, setPane] = useState<"request" | "response" | "query">("request");
   const badge = getStatusBadge(entry.status, entry.encrypted, entry.tlsError);
   const url = entryUrl(entry);
   const params = queryParams(url);
 
+  // Resizable / maximizable detail panel
+  const [paneWidth, setPaneWidth] = useState(520);
+  const [maximized, setMaximized] = useState(false);
+  const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  const onMouseDownHandle = (e: React.MouseEvent) => {
+    dragState.current = { startX: e.clientX, startWidth: paneWidth };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!dragState.current) return;
+      const delta = dragState.current.startX - e.clientX;
+      const next = Math.min(window.innerWidth * 0.85, Math.max(320, dragState.current.startWidth + delta));
+      setPaneWidth(next);
+    };
+    const onUp = () => {
+      if (dragState.current) {
+        dragState.current = null;
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  // Collapsible sections (independent, DevTools-style)
+  const [openMap, setOpenMap] = useState<Record<string, boolean>>(DEFAULT_OPEN_SECTIONS);
+  const toggle = (id: string) => setOpenMap((m) => ({ ...m, [id]: m[id] === false }));
+
+  // Cmd/Ctrl+C: native selection copies itself; with no selection, copy the dump.
+  const onKeyDownPane = async (e: React.KeyboardEvent) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "c") {
+      const sel = window.getSelection()?.toString().trim();
+      if (!sel) {
+        e.preventDefault();
+        await copyText(buildFullDump(entry));
+      }
+    }
+  };
+
   return (
     <div
+      tabIndex={0}
+      onKeyDown={onKeyDownPane}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
       style={{
-        width: "min(520px, 48%)",
+        position: "relative",
+        width: maximized ? "min(1200px, 82%)" : paneWidth,
         minWidth: 320,
         borderLeft: "1px solid var(--border)",
         background: "#0c0c0f",
         padding: 14,
         display: "flex",
         flexDirection: "column",
-        gap: 10,
+        gap: 8,
         overflowY: "auto",
         fontSize: 11,
       }}
     >
+      {/* Drag handle to widen/narrow the panel */}
+      {!maximized ? (
+        <div
+          onMouseDown={onMouseDownHandle}
+          title="Drag to resize"
+          style={{
+            position: "absolute",
+            left: -3,
+            top: 0,
+            bottom: 0,
+            width: 6,
+            cursor: "col-resize",
+            zIndex: 5,
+          }}
+        />
+      ) : null}
+
+      {/* Header */}
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ color: getMethodColor(entry.method), fontWeight: 700, fontSize: 13 }}>
@@ -437,44 +738,32 @@ function RequestDetail({
               marginTop: 4,
               lineHeight: 1.45,
               userSelect: "text",
+              cursor: "text",
             }}
           >
             {url}
           </div>
-          {entry.path ? (
-            <div style={{ color: "var(--muted)", marginTop: 4, wordBreak: "break-all" }}>
-              path {entry.path}
-            </div>
-          ) : null}
           {capturedFrom(entry) ? (
             <div style={{ color: "#64d2ff", marginTop: 4 }}>{capturedFrom(entry)}</div>
           ) : null}
         </div>
-        <button className="icon-btn" style={{ width: 22, height: 22, flexShrink: 0 }} onClick={onClose}>
-          ×
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+          <button
+            className="icon-btn"
+            style={{ width: 22, height: 22 }}
+            title={maximized ? "Restore size" : "Maximize panel"}
+            onClick={() => setMaximized((v) => !v)}
+          >
+            {maximized ? "⤡" : "⤢"}
+          </button>
+          <button className="icon-btn" style={{ width: 22, height: 22 }} onClick={onClose}>
+            ×
+          </button>
+        </div>
       </div>
 
-      <div>
-        {entry.tlsError ? (
-          <div
-            style={{
-              color: "#ff453a",
-              background: "rgba(255,69,58,0.12)",
-              border: "1px solid rgba(255,69,58,0.4)",
-              borderRadius: 8,
-              padding: "6px 10px",
-              marginBottom: 8,
-              wordBreak: "break-word",
-              lineHeight: 1.45,
-            }}
-          >
-            TLS decrypt failed — traffic not captured.
-            {entry.tlsError.includes("certificate_unknown") || entry.tlsError.includes("CertificateUnknown")
-              ? " The TV rejected our MITM certificate (certificate_unknown): the app is certificate-pinned, or the MITM CA is not trusted by this build."
-              : ""}
-          </div>
-        ) : null}
+      {/* Status row */}
+      <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6, userSelect: "none" }}>
         <span
           style={{
             fontSize: 11,
@@ -487,140 +776,153 @@ function RequestDetail({
         >
           {badge.label}
         </span>
-        <span style={{ color: "var(--muted)", marginLeft: 8 }}>
+        <span style={{ color: "var(--muted)" }}>
           {entry.host ? `${entry.host} · ` : ""}
           {entry.durationMs != null ? `${entry.durationMs} ms` : "—"}
           {entry.size != null ? ` · ${entry.size} B` : ""}
         </span>
-        <button
-          className="surface-btn"
-          style={{ width: "auto", padding: "2px 8px", marginLeft: 8, fontSize: 10 }}
-          onClick={() => navigator.clipboard.writeText(url)}
-        >
-          Copy URL
-        </button>
+        <CopyButton getText={() => url} label="URL" />
+        <CopyButton getText={() => buildFullDump(entry)} label="All" />
       </div>
 
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-        {(["request", "response", "query"] as const).map((tab) => (
-          <button
-            key={tab}
-            className="surface-btn"
-            onClick={() => setPane(tab)}
-            style={{
-              width: "auto",
-              padding: "4px 10px",
-              fontSize: 11,
-              fontWeight: pane === tab ? 700 : 400,
-              background: pane === tab ? "rgba(10,132,255,0.2)" : "rgba(255,255,255,0.06)",
-              color: pane === tab ? "#0a84ff" : "inherit",
-            }}
-          >
-            {tab === "request" ? "Request" : tab === "response" ? "Response" : `Query (${params.length})`}
-          </button>
-        ))}
-      </div>
-
-      {pane === "request" ? (
-        <>
-          <HeaderTable title="Request headers" headers={entry.requestHeaders} />
-          <BodyBlock
-            title="Request body"
-            body={entry.requestBody}
-            empty={
-              entry.tlsError
-                ? "TLS tunnel could not be decrypted."
-                : (entry.method || "").toUpperCase() === "CONNECT"
-                ? "Tunnel row — open a decrypted request below the same host for path/body."
-                : "No request body."
-            }
-          />
-        </>
-      ) : pane === "response" ? (
-        <>
-          <HeaderTable title="Response headers" headers={entry.responseHeaders} />
-          <BodyBlock
-            title="Response body"
-            body={entry.responseBody}
-            empty={
-              entry.tlsError
-                ? "TLS tunnel could not be decrypted."
-                : (entry.method || "").toUpperCase() === "CONNECT"
-                ? "Tunnel row — open a decrypted request below the same host."
-                : "No response body."
-            }
-          />
-        </>
-      ) : (
-        <HeaderTable
-          title="Query parameters"
-          headers={Object.fromEntries(params)}
-        />
-      )}
-    </div>
-  );
-}
-
-function HeaderTable({
-  title,
-  headers,
-}: {
-  title: string;
-  headers?: Record<string, string>;
-}) {
-  const rows = Object.entries(headers || {});
-  return (
-    <div>
-      <div style={{ color: "var(--muted)", fontSize: 10, textTransform: "uppercase", marginBottom: 6 }}>
-        {title}
-      </div>
-      {rows.length === 0 ? (
-        <div style={{ color: "var(--muted)" }}>None captured.</div>
-      ) : (
+      {entry.tlsError ? (
         <div
           style={{
-            border: "1px solid var(--border)",
+            color: "#ff453a",
+            background: "rgba(255,69,58,0.12)",
+            border: "1px solid rgba(255,69,58,0.4)",
             borderRadius: 8,
-            overflow: "hidden",
+            padding: "6px 10px",
+            wordBreak: "break-word",
+            lineHeight: 1.45,
+            userSelect: "text",
           }}
         >
-          {rows.map(([name, value]) => (
-            <div
-              key={name}
-              style={{
-                display: "grid",
-                gridTemplateColumns: "140px 1fr",
-                gap: 8,
-                padding: "5px 8px",
-                borderBottom: "1px solid rgba(255,255,255,0.04)",
-                wordBreak: "break-all",
-              }}
-            >
-              <span style={{ color: "#64d2ff", fontWeight: 600 }}>{name}</span>
-              <span>{value}</span>
-            </div>
-          ))}
+          TLS decrypt failed — traffic not captured.
+          {entry.tlsError.includes("certificate_unknown") || entry.tlsError.includes("CertificateUnknown")
+            ? " The TV rejected our MITM certificate (certificate_unknown): the app is certificate-pinned, or the MITM CA is not trusted by this build."
+            : ""}
         </div>
-      )}
-    </div>
-  );
-}
+      ) : null}
 
-function BodyBlock({
-  title,
-  body,
-  empty,
-}: {
-  title: string;
-  body?: string;
-  empty: string;
-}) {
-  return (
-    <div>
-      <div style={{ color: "var(--muted)", fontSize: 10, textTransform: "uppercase", marginBottom: 6 }}>
-        {title}
-      </div>
-      {body ? <JsonSyntaxViewer data={body} /> : <div style={{ color: "var(--muted)" }}>{empty}</div>}
+      {/* Collapsible sections */}
+      <Section
+        id="overview"
+        title="Overview"
+        openMap={openMap}
+        toggle={toggle}
+      >
+        <HeaderTable
+          headers={{
+            Method: entry.method,
+            Host: entry.host || "—",
+            Path: entry.path || "—",
+            Status: entry.status != null ? String(entry.status) : "—",
+            Duration: entry.durationMs != null ? `${entry.durationMs} ms` : "—",
+            Size: entry.size != null ? `${entry.size} B` : "—",
+            Scheme: entry.encrypted ? "https" : "http",
+            ...(capturedFrom(entry) ? { Source: capturedFrom(entry) } : {}),
+          }}
+        />
+      </Section>
+
+      <Section
+        id="url"
+        title={`URL + query (${params.length})`}
+        openMap={openMap}
+        toggle={toggle}
+        actions={<CopyButton compact getText={() => url} label="URL" />}
+      >
+        <div style={{ marginBottom: 6 }}>
+          <div style={{ color: "var(--muted)", fontSize: 10, textTransform: "uppercase", marginBottom: 4 }}>Full URL</div>
+          <div
+            style={{
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              wordBreak: "break-all",
+              lineHeight: 1.45,
+              userSelect: "text",
+              cursor: "text",
+              padding: "4px 8px",
+              background: "#060608",
+              border: "1px solid var(--border)",
+              borderRadius: 8,
+            }}
+          >
+            {url}
+          </div>
+        </div>
+        {params.length > 0 ? <HeaderTable headers={Object.fromEntries(params)} /> : null}
+      </Section>
+
+      <Section
+        id="requestHeaders"
+        title="Request headers"
+        openMap={openMap}
+        toggle={toggle}
+        actions={
+          <CopyButton compact getText={() => headersToText(entry.requestHeaders)} label="Request headers" />
+        }
+      >
+        <HeaderTable headers={entry.requestHeaders} />
+      </Section>
+
+      <Section
+        id="requestBody"
+        title="Request body"
+        openMap={openMap}
+        toggle={toggle}
+        actions={
+          entry.requestBody ? <CopyButton compact getText={() => entry.requestBody || ""} label="Request body" /> : null
+        }
+      >
+        {entry.requestBody ? (
+          <BodyViewer body={entry.requestBody} />
+        ) : (
+          <div style={{ color: "var(--muted)" }}>
+            {entry.tlsError
+              ? "TLS tunnel could not be decrypted."
+              : (entry.method || "").toUpperCase() === "CONNECT"
+              ? "Tunnel row — open a decrypted request below the same host for path/body."
+              : "No request body."}
+          </div>
+        )}
+      </Section>
+
+      <Section
+        id="responseHeaders"
+        title="Response headers"
+        openMap={openMap}
+        toggle={toggle}
+        actions={
+          <CopyButton compact getText={() => headersToText(entry.responseHeaders)} label="Response headers" />
+        }
+      >
+        <HeaderTable headers={entry.responseHeaders} />
+      </Section>
+
+      <Section
+        id="responseBody"
+        title="Response body"
+        openMap={openMap}
+        toggle={toggle}
+        actions={
+          entry.responseBody ? (
+            <CopyButton compact getText={() => entry.responseBody || ""} label="Response body" />
+          ) : null
+        }
+      >
+        {entry.responseBody ? (
+          <BodyViewer body={entry.responseBody} />
+        ) : (
+          <div style={{ color: "var(--muted)" }}>
+            {entry.tlsError
+              ? "TLS tunnel could not be decrypted."
+              : (entry.method || "").toUpperCase() === "CONNECT"
+              ? "Tunnel row — open a decrypted request below the same host."
+              : "No response body."}
+          </div>
+        )}
+      </Section>
     </div>
   );
 }
