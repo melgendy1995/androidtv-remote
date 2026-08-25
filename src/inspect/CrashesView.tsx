@@ -11,7 +11,7 @@ export function CrashesView({
   onSave: (id: string) => void;
   onClear: () => void;
 }) {
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [openStacks, setOpenStacks] = useState<Record<string, boolean>>({});
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const copyCrash = async (c: CrashEntry, kind: "full" | "stack") => {
@@ -45,7 +45,7 @@ export function CrashesView({
         </button>
       </div>
       {entries.map((c) => {
-        const hidden = !!collapsed[c.id];
+        const open = !!openStacks[c.id];
         return (
           <div key={c.id} style={{ borderBottom: "1px solid var(--border)", padding: "12px 14px" }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -85,34 +85,49 @@ export function CrashesView({
               <div style={{ color: "#ff453a", fontWeight: 700, fontSize: 12, marginTop: 6 }}>
                 {c.exception}
               </div>
+            ) : !open ? (
+              <div
+                className="hint"
+                style={{
+                  margin: "6px 0",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {c.reason}
+              </div>
             ) : null}
-            <div className="hint" style={{ margin: "6px 0", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {c.reason}
-            </div>
-            <button
-              className="accent"
-              style={{ fontSize: 11 }}
-              onClick={() => setCollapsed((m) => ({ ...m, [c.id]: !hidden }))}
-            >
-              {hidden ? "Show stack" : "Hide stack"}
-            </button>
-            {!hidden && c.stack ? (
+            {open ? (
+              <div className="hint" style={{ margin: "6px 0", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                {c.reason}
+              </div>
+            ) : null}
+            <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8 }}>
               <button
                 className="surface-btn"
-                style={{
-                  width: "auto",
-                  padding: "2px 8px",
-                  marginLeft: 6,
-                  fontSize: 11,
-                  color: copiedKey === `${c.id}:stack` ? "#30d158" : "inherit",
-                  fontWeight: copiedKey === `${c.id}:stack` ? 700 : 400,
-                }}
-                onClick={() => copyCrash(c, "stack")}
+                style={{ width: "auto", padding: "4px 10px", fontSize: 11 }}
+                onClick={() => setOpenStacks((m) => ({ ...m, [c.id]: !open }))}
               >
-                {copiedKey === `${c.id}:stack` ? "✓ Copied" : "⧉ Copy stack"}
+                {open ? "Hide stack trace" : "Show stack trace"}
               </button>
-            ) : null}
-            {hidden ? null : (
+              {open && c.stack ? (
+                <button
+                  className="surface-btn"
+                  style={{
+                    width: "auto",
+                    padding: "4px 10px",
+                    fontSize: 11,
+                    color: copiedKey === `${c.id}:stack` ? "#30d158" : "inherit",
+                    fontWeight: copiedKey === `${c.id}:stack` ? 700 : 400,
+                  }}
+                  onClick={() => copyCrash(c, "stack")}
+                >
+                  {copiedKey === `${c.id}:stack` ? "✓ Copied" : "Copy stack"}
+                </button>
+              ) : null}
+            </div>
+            {open ? (
               <pre
                 style={{
                   whiteSpace: "pre-wrap",
@@ -131,7 +146,7 @@ export function CrashesView({
               >
                 {c.stack || "(no stack captured)"}
               </pre>
-            )}
+            ) : null}
           </div>
         );
       })}
