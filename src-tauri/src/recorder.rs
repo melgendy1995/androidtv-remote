@@ -6,6 +6,10 @@ use std::time::Instant;
 
 use crate::error::{AppError, Result};
 
+/// Media timescale in ticks per second. 1000 = milliseconds, so duration
+/// matches wall-clock recording length instead of a guessed frame rate.
+const TIMESCALE: u32 = 1000;
+
 struct Sample {
     offset: u64,
     size: u32,
@@ -60,14 +64,17 @@ impl VideoRecorder {
         sps: Vec<u8>,
         pps: Vec<u8>,
     ) -> Result<()> {
+        let mut lock = self.inner.lock().unwrap();
+        if lock.is_some() {
+            return Err(AppError::from("already recording"));
+        }
         let mut file = File::create(path)?;
         write_ftyp(&mut file)?;
-        // Reserve the mdat header up front; patched in finalize(). Always
-        // written in largesize form (size=1 + u64) so recordings beyond
-        // 4 GB stay valid MP4s.
+        // Reserve 16 bytes: either a 64-bit mdat header, or `free`(8)+`mdat`(8)
+        // for files that fit in a 32-bit box size. Patched in finalize().
         file.write_all(&[0u8; 16])?;
         let mdat_start = file.stream_position()? - 16;
-        let inner = Inner {
+        *lock = Some(Inner {
             path: path.to_string_lossy().to_string(),
             file,
             mdat_start,
@@ -77,8 +84,7 @@ impl VideoRecorder {
             width: width.max(16),
             height: height.max(16),
             started: Instant::now(),
-        };
-        *self.inner.lock().unwrap() = Some(inner);
+        });
         Ok(())
     }
 
@@ -104,6 +110,11 @@ impl VideoRecorder {
         let Some(inner) = lock.as_mut() else {
             return Ok(());
         };
+        // Players cannot decode from a mid-GOP P-frame. Drop everything until
+        // the first IDR so the file opens instead of looking corrupt.
+        if avcc.is_empty() || (inner.samples.is_empty() && !key) {
+            return Ok(());
+        }
         let offset = inner.file.stream_position()?;
         inner.file.write_all(avcc)?;
         inner.samples.push(Sample {
@@ -119,23 +130,46 @@ impl VideoRecorder {
         let Some(mut inner) = lock.take() else {
             return Err(AppError::from("not recording"));
         };
+        if inner.samples.is_empty() || inner.sps.is_empty() || inner.pps.is_empty() {
+            let path = inner.path.clone();
+            drop(inner.file);
+            let _ = std::fs::remove_file(&path);
+            return Err(AppError::from(
+                "recording produced no playable video (need a keyframe; keep Rec running or wait until the picture is on screen)",
+            ));
+        }
         finalize(&mut inner)?;
+        inner.file.flush()?;
         Ok(inner.path)
     }
 }
 
 fn finalize(inner: &mut Inner) -> Result<()> {
     let mdat_end = inner.file.stream_position()?;
-    let mdat_size = mdat_end - inner.mdat_start;
-    inner.file.seek(SeekFrom::Start(inner.mdat_start))?;
-    write_u32(&mut inner.file, 1)?;
-    inner.file.write_all(b"mdat")?;
-    write_u64(&mut inner.file, mdat_size)?;
+    patch_mdat_header(&mut inner.file, inner.mdat_start, mdat_end)?;
     inner.file.seek(SeekFrom::End(0))?;
 
     let mut moov = Vec::new();
     write_moov(&mut moov, inner)?;
     inner.file.write_all(&moov)?;
+    Ok(())
+}
+
+fn patch_mdat_header(file: &mut File, mdat_start: u64, mdat_end: u64) -> Result<()> {
+    let total = mdat_end - mdat_start;
+    file.seek(SeekFrom::Start(mdat_start))?;
+    // Prefer a 32-bit mdat. A leading `free` box eats the extra 8 bytes we
+    // reserved for the 64-bit header so sample offsets stay valid.
+    if total.saturating_sub(8) <= u32::MAX as u64 {
+        write_u32(file, 8)?;
+        file.write_all(b"free")?;
+        write_u32(file, (total - 8) as u32)?;
+        file.write_all(b"mdat")?;
+    } else {
+        write_u32(file, 1)?;
+        file.write_all(b"mdat")?;
+        write_u64(file, total)?;
+    }
     Ok(())
 }
 
@@ -153,69 +187,64 @@ fn write_ftyp(file: &mut File) -> Result<()> {
 }
 
 fn write_moov(out: &mut Vec<u8>, inner: &Inner) -> Result<()> {
+    let (duration, stts_body) = media_duration_and_stts(inner);
     let mut moov = Vec::new();
-    write_mvhd(&mut moov, inner.samples.len() as u32);
-    write_trak(&mut moov, inner)?;
+    write_mvhd(&mut moov, duration);
+    write_trak(&mut moov, inner, duration, &stts_body)?;
     write_box(out, *b"moov", &moov);
     Ok(())
 }
 
-fn write_mvhd(out: &mut Vec<u8>, frames: u32) {
+fn write_mvhd(out: &mut Vec<u8>, duration: u32) {
     let mut body = Vec::new();
     body.extend_from_slice(&0u32.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
-    body.extend_from_slice(&30u32.to_be_bytes());
-    body.extend_from_slice(&frames.to_be_bytes());
+    body.extend_from_slice(&TIMESCALE.to_be_bytes());
+    body.extend_from_slice(&duration.to_be_bytes());
     body.extend_from_slice(&0x00010000u32.to_be_bytes());
     body.extend_from_slice(&0x0100u16.to_be_bytes());
     body.extend_from_slice(&0u16.to_be_bytes());
     body.extend_from_slice(&0u64.to_be_bytes());
-    body.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
-    body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0x00, 0x00]);
-    body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    body.extend_from_slice(&[0x40, 0x00, 0x00, 0x00]);
+    body.extend_from_slice(&identity_matrix());
     body.extend_from_slice(&[0u8; 24]);
     body.extend_from_slice(&2u32.to_be_bytes());
     write_box(out, *b"mvhd", &body);
 }
 
-fn write_trak(out: &mut Vec<u8>, inner: &Inner) -> Result<()> {
+fn write_trak(out: &mut Vec<u8>, inner: &Inner, duration: u32, stts_body: &[u8]) -> Result<()> {
     let mut trak = Vec::new();
-    write_tkhd(&mut trak, inner);
-    write_mdia(&mut trak, inner)?;
+    write_tkhd(&mut trak, inner, duration);
+    write_mdia(&mut trak, inner, duration, stts_body)?;
     write_box(out, *b"trak", &trak);
     Ok(())
 }
 
-fn write_tkhd(out: &mut Vec<u8>, inner: &Inner) {
+fn write_tkhd(out: &mut Vec<u8>, inner: &Inner, duration: u32) {
     let mut body = Vec::new();
     body.extend_from_slice(&0x00000007u32.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
     body.extend_from_slice(&1u32.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
-    body.extend_from_slice(&(inner.samples.len() as u32).to_be_bytes());
+    body.extend_from_slice(&duration.to_be_bytes());
     body.extend_from_slice(&0u64.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
-    body.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
-    body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0x00, 0x00]);
-    body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    body.extend_from_slice(&[0x40, 0x00, 0x00, 0x00]);
+    body.extend_from_slice(&identity_matrix());
     body.extend_from_slice(&(inner.width << 16).to_be_bytes());
     body.extend_from_slice(&(inner.height << 16).to_be_bytes());
     write_box(out, *b"tkhd", &body);
 }
 
-fn write_mdia(out: &mut Vec<u8>, inner: &Inner) -> Result<()> {
+fn write_mdia(out: &mut Vec<u8>, inner: &Inner, duration: u32, stts_body: &[u8]) -> Result<()> {
     let mut mdia = Vec::new();
     let mut mdhd = Vec::new();
     mdhd.extend_from_slice(&0u32.to_be_bytes());
     mdhd.extend_from_slice(&0u32.to_be_bytes());
     mdhd.extend_from_slice(&0u32.to_be_bytes());
-    mdhd.extend_from_slice(&30u32.to_be_bytes());
-    mdhd.extend_from_slice(&(inner.samples.len() as u32).to_be_bytes());
+    mdhd.extend_from_slice(&TIMESCALE.to_be_bytes());
+    mdhd.extend_from_slice(&duration.to_be_bytes());
     mdhd.extend_from_slice(&0x55c40000u32.to_be_bytes());
     write_box(&mut mdia, *b"mdhd", &mdhd);
 
@@ -236,19 +265,16 @@ fn write_mdia(out: &mut Vec<u8>, inner: &Inner) -> Result<()> {
     write_box(&mut dref, *b"url ", &[0, 0, 0, 1]);
     write_box(&mut dinf, *b"dref", &dref);
     write_box(&mut minf, *b"dinf", &dinf);
-    write_stbl(&mut minf, inner)?;
+    write_stbl(&mut minf, inner, stts_body)?;
     write_box(&mut mdia, *b"minf", &minf);
     write_box(out, *b"mdia", &mdia);
     Ok(())
 }
 
-fn write_stbl(out: &mut Vec<u8>, inner: &Inner) -> Result<()> {
+fn write_stbl(out: &mut Vec<u8>, inner: &Inner, stts_body: &[u8]) -> Result<()> {
     let mut stbl = Vec::new();
     write_stsd(&mut stbl, inner);
-    let mut stts = vec![0, 0, 0, 0, 0, 0, 0, 1];
-    stts.extend_from_slice(&(inner.samples.len() as u32).to_be_bytes());
-    stts.extend_from_slice(&1u32.to_be_bytes());
-    write_box(&mut stbl, *b"stts", &stts);
+    write_box(&mut stbl, *b"stts", stts_body);
 
     let keys: Vec<u32> = inner
         .samples
@@ -264,8 +290,11 @@ fn write_stbl(out: &mut Vec<u8>, inner: &Inner) -> Result<()> {
     }
     write_box(&mut stbl, *b"stss", &stss);
 
-    let mut stsc = vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1];
-    stsc.extend_from_slice(&(inner.samples.len() as u32).to_be_bytes());
+    // One sample per chunk, matching the N entries in stco/co64.
+    let mut stsc = vec![0, 0, 0, 0];
+    stsc.extend_from_slice(&1u32.to_be_bytes());
+    stsc.extend_from_slice(&1u32.to_be_bytes());
+    stsc.extend_from_slice(&1u32.to_be_bytes());
     stsc.extend_from_slice(&1u32.to_be_bytes());
     write_box(&mut stbl, *b"stsc", &stsc);
 
@@ -321,9 +350,9 @@ fn write_stsd(out: &mut Vec<u8>, inner: &Inner) {
     avc1[26..28].copy_from_slice(&(inner.height as u16).to_be_bytes());
     avc1[28..32].copy_from_slice(&0x00480000u32.to_be_bytes());
     avc1[32..36].copy_from_slice(&0x00480000u32.to_be_bytes());
-    avc1[41] = 1;
-    avc1[72..74].copy_from_slice(&0x0018u16.to_be_bytes());
-    avc1[74..76].copy_from_slice(&(-1i16).to_be_bytes());
+    avc1[40..42].copy_from_slice(&1u16.to_be_bytes());
+    avc1[74..76].copy_from_slice(&0x0018u16.to_be_bytes());
+    avc1[76..78].copy_from_slice(&(-1i16).to_be_bytes());
     let mut avc1_full = avc1;
     write_box(&mut avc1_full, *b"avcC", &avcc);
 
@@ -349,6 +378,43 @@ fn write_u64(file: &mut File, value: u64) -> Result<()> {
     Ok(())
 }
 
+fn identity_matrix() -> [u8; 36] {
+    let mut matrix = [0u8; 36];
+    matrix[0..4].copy_from_slice(&0x00010000u32.to_be_bytes());
+    matrix[16..20].copy_from_slice(&0x00010000u32.to_be_bytes());
+    matrix[32..36].copy_from_slice(&0x40000000u32.to_be_bytes());
+    matrix
+}
+
+fn media_duration_and_stts(inner: &Inner) -> (u32, Vec<u8>) {
+    let n = inner.samples.len() as u64;
+    let elapsed_ms = (inner.started.elapsed().as_millis() as u64).max(n.max(1));
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut prev = 0u64;
+    for i in 1..=n {
+        let t = elapsed_ms * i / n;
+        let delta = (t - prev).max(1) as u32;
+        prev += u64::from(delta);
+        if let Some((count, last_delta)) = runs.last_mut() {
+            if *last_delta == delta {
+                *count += 1;
+                continue;
+            }
+        }
+        runs.push((1, delta));
+    }
+    let duration = runs
+        .iter()
+        .fold(0u32, |acc, (count, delta)| acc.saturating_add(count.saturating_mul(*delta)));
+    let mut stts = vec![0, 0, 0, 0];
+    stts.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+    for (count, delta) in runs {
+        stts.extend_from_slice(&count.to_be_bytes());
+        stts.extend_from_slice(&delta.to_be_bytes());
+    }
+    (duration, stts)
+}
+
 pub fn split_sps_pps(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let nalus = split_nalus(data);
     let mut sps = Vec::new();
@@ -367,7 +433,7 @@ pub fn split_sps_pps(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 pub fn split_nalus(data: &[u8]) -> Vec<Vec<u8>> {
-    if data.windows(4).any(|w| w == [0, 0, 0, 1]) || data.windows(3).any(|w| w == [0, 0, 1]) {
+    if data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]) {
         return split_annexb(data);
     }
     let mut out = Vec::new();
@@ -469,16 +535,68 @@ mod tests {
         assert!(!contains_idr(&frame));
     }
 
+    fn temp_mp4() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "atv-recorder-test-{}-{}.mp4",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn find_box<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+        find_box_from(data, kind, 0)
+    }
+
+    fn find_box_from<'a>(data: &'a [u8], kind: &[u8; 4], start: usize) -> Option<&'a [u8]> {
+        let mut i = start;
+        while i + 8 <= data.len() {
+            let mut size = u32::from_be_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+            let box_kind = &data[i + 4..i + 8];
+            let mut header = 8;
+            if size == 1 {
+                if i + 16 > data.len() {
+                    break;
+                }
+                size = u64::from_be_bytes(data[i + 8..i + 16].try_into().unwrap()) as usize;
+                header = 16;
+            } else if size == 0 {
+                size = data.len() - i;
+            }
+            if size < header || i + size > data.len() {
+                break;
+            }
+            let body = &data[i + header..i + size];
+            if box_kind == kind {
+                return Some(body);
+            }
+            let nested_start = match box_kind {
+                b"avc1" => 78,
+                b"stsd" => 8,
+                _ => 0,
+            };
+            if matches!(
+                box_kind,
+                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"stsd" | b"avc1"
+            ) {
+                if let Some(found) = find_box_from(body, kind, nested_start) {
+                    return Some(found);
+                }
+            }
+            i += size;
+        }
+        None
+    }
+
     #[test]
-    fn writes_ftyp_largesize_mdat_and_valid_offsets() {
-        let path = std::env::temp_dir().join(format!(
-            "atv-recorder-test-{}.mp4",
-            std::process::id()
-        ));
+    fn writes_playable_mp4_layout() {
+        let path = temp_mp4();
         let recorder = VideoRecorder::new();
         let sps = vec![0x67, 0x64, 0x00, 0x28];
         let pps = vec![0x68, 0xeb, 0xec, 0xb2];
-        recorder.start(&path, 1920, 1080, sps.clone(), pps.clone()).unwrap();
+        recorder.start(&path, 1920, 1080, sps, pps).unwrap();
         let frame = vec![0u8; 64];
         recorder.push_sample(&frame, true).unwrap();
         recorder.push_sample(&frame, false).unwrap();
@@ -486,17 +604,71 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        // ftyp first (32 bytes: size+type+isom+minor+4 brands)
+
         assert_eq!(&bytes[4..8], b"ftyp");
-        assert_eq!(&bytes[32..36], &[0, 0, 0, 1]); // largesize marker
-        assert_eq!(&bytes[36..40], b"mdat");
-        let mdat_size = u64::from_be_bytes(bytes[40..48].try_into().unwrap());
-        // first sample data starts right after the 16-byte mdat header
+        assert_eq!(&bytes[32..40], &[0, 0, 0, 8, b'f', b'r', b'e', b'e']);
+        assert_eq!(&bytes[44..48], b"mdat");
         assert_eq!(&bytes[48..54], &[0u8; 6]);
-        // moov appended after mdat
-        let moov_at = 32 + mdat_size as usize;
-        assert_eq!(&bytes[moov_at + 4..moov_at + 8], b"moov");
-        // sample offsets point at real data (first frame right after mdat header)
-        assert!(bytes.windows(4).any(|w| w == b"stco"));
+
+        let mvhd = find_box(&bytes, b"mvhd").expect("mvhd");
+        assert_eq!(mvhd.len(), 100, "mvhd v0 body must be 100 bytes");
+        assert_eq!(&mvhd[36..40], &[0x00, 0x01, 0x00, 0x00]);
+        assert_eq!(&mvhd[52..56], &[0x00, 0x01, 0x00, 0x00]);
+        assert_eq!(&mvhd[68..72], &[0x40, 0x00, 0x00, 0x00]);
+
+        let tkhd = find_box(&bytes, b"tkhd").expect("tkhd");
+        assert_eq!(tkhd.len(), 84, "tkhd v0 body must be 84 bytes");
+
+        let avc1 = find_box(&bytes, b"avc1").expect("avc1");
+        assert_eq!(&avc1[74..76], &[0x00, 0x18], "depth must be 24");
+        assert_eq!(&avc1[76..78], &[0xff, 0xff], "pre_defined must be -1");
+
+        let stsc = find_box(&bytes, b"stsc").expect("stsc");
+        assert_eq!(&stsc[12..16], &[0, 0, 0, 1], "one sample per chunk");
+
+        let stco = find_box(&bytes, b"stco").expect("stco");
+        assert_eq!(&stco[4..8], &[0, 0, 0, 2], "one chunk offset per sample");
+        let first_offset = u32::from_be_bytes(stco[8..12].try_into().unwrap());
+        assert_eq!(first_offset, 48);
+    }
+
+    #[test]
+    fn drops_leading_delta_frames_until_keyframe() {
+        let path = temp_mp4();
+        let recorder = VideoRecorder::new();
+        let sps = vec![0x67, 0x64, 0x00, 0x28];
+        let pps = vec![0x68, 0xeb, 0xec, 0xb2];
+        recorder.start(&path, 1280, 720, sps, pps).unwrap();
+        let frame = vec![0u8; 32];
+        recorder.push_sample(&frame, false).unwrap();
+        recorder.push_sample(&frame, false).unwrap();
+        recorder.push_sample(&frame, true).unwrap();
+        recorder.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let stsz = find_box(&bytes, b"stsz").expect("stsz");
+        assert_eq!(&stsz[8..12], &[0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn finish_without_a_keyframe_removes_the_file() {
+        let path = temp_mp4();
+        let recorder = VideoRecorder::new();
+        let sps = vec![0x67, 0x64, 0x00, 0x28];
+        let pps = vec![0x68, 0xeb, 0xec, 0xb2];
+        recorder.start(&path, 1280, 720, sps, pps).unwrap();
+        recorder.push_sample(&[0u8; 16], false).unwrap();
+        assert!(recorder.finish().is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn split_nalus_does_not_treat_avcc_payload_as_annex_b() {
+        let mut avcc = Vec::new();
+        avcc.extend_from_slice(&5u32.to_be_bytes());
+        avcc.extend_from_slice(&[0x65, 0, 0, 1, 0x42]);
+        let nalus = split_nalus(&avcc);
+        assert_eq!(nalus, vec![vec![0x65, 0, 0, 1, 0x42]]);
     }
 }

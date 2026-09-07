@@ -246,6 +246,8 @@ Successful `CONNECT` rows are hidden once decrypted requests exist for that host
 
 **Charles instead of the built-in tab:** Settings → **TV HTTP proxy** → **Charles**, set this computer’s LAN IP and Charles port (default **8888**). The TV then points at Charles; the Network tab will not see those decrypted calls.
 
+**Reset TV proxy:** clears `http_proxy` / `global_http_proxy_*` and sets `http_proxy` to `:0` (no proxy). Use this after Charles or the built-in inspect proxy so the TV can reach the internet again.
+
 **Don’t change TV proxy:** leaves `http_proxy` / `global_http_proxy_*` alone.
 
 #### Crashes
@@ -273,7 +275,7 @@ Both use **Settings → Capture Directory** (default `~/Downloads/AndroidTV Capt
 | Max Stream Resolution | 1080p (`1920`) | Also **720p** (`1280`) or Native (`0`) |
 | Video Bitrate | 8 Mbps | 2 / 8 / 16 Mbps |
 | Max Target FPS | 60 | 30 or 60 |
-| TV HTTP proxy | Built-in Network tab | `builtin` / `charles` / `off` |
+| TV HTTP proxy | Built-in Network tab | `builtin` / `charles` / `reset` / `off` |
 | Inspect Proxy Port | `8899` | Built-in mode only |
 | Charles host / port | empty / `8888` | Charles mode only |
 | Capture Directory | empty | Screenshots, recordings, logcat export. Empty → `~/Downloads/AndroidTV Captures` |
@@ -336,7 +338,7 @@ Stored at `~/.androidtv-remote/settings.json`. Saved devices at `~/.androidtv-re
 | `maxSize` | Max Stream Resolution | `1920` |
 | `bitRate` | Video Bitrate | `8000000` |
 | `maxFps` | Max Target FPS | `60` |
-| `deviceProxyMode` | TV HTTP proxy | `"builtin"` |
+| `deviceProxyMode` | TV HTTP proxy | `"builtin"` (`reset` / `charles` / `off`) |
 | `charlesHost` | Charles host | `""` |
 | `charlesPort` | Charles port | `8888` |
 

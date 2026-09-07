@@ -95,6 +95,10 @@ impl ScrcpySession {
         self.pps.lock().await.clone()
     }
 
+    pub async fn keyframe_snapshot(&self) -> Option<Vec<u8>> {
+        self.latest_keyframe.lock().await.clone()
+    }
+
     pub async fn stop(&self) {
         if let Some(tx) = self.stop.lock().await.take() {
             let _ = tx.send(true);

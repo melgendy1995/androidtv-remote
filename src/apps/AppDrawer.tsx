@@ -56,6 +56,7 @@ export function AppDrawer({ open, onClose }: Props) {
   const [actionError, setActionError] = useState<string>();
   const [actionStatus, setActionStatus] = useState<string>();
   const [apkPath, setApkPath] = useState("");
+  const [installing, setInstalling] = useState(false);
 
   const loadApps = useCallback(async () => {
     setLoading(true);
@@ -176,18 +177,20 @@ export function AppDrawer({ open, onClose }: Props) {
   };
 
   const handleInstallApk = async () => {
-    if (!apkPath.trim()) return;
+    if (!apkPath.trim() || installing) return;
     setActionError(undefined);
-    setActionStatus("Installing APK...");
+    setActionStatus(undefined);
+    setInstalling(true);
     try {
       const res = await api.installApk(apkPath.trim());
-      setActionStatus(res);
       setApkPath("");
-      loadApps();
-      setTimeout(() => setActionStatus(undefined), 3000);
+      setActionStatus(res);
+      await loadApps();
+      setTimeout(() => setActionStatus(undefined), 2000);
     } catch (e) {
       setActionError(String(e));
-      setActionStatus(undefined);
+    } finally {
+      setInstalling(false);
     }
   };
 
@@ -273,6 +276,7 @@ export function AppDrawer({ open, onClose }: Props) {
           <button
             className="surface-btn"
             onClick={handleBrowseApk}
+            disabled={installing}
             style={{ width: "auto", padding: "8px 12px", fontSize: 12 }}
           >
             📂 Browse APK…
@@ -280,10 +284,23 @@ export function AppDrawer({ open, onClose }: Props) {
           <button
             className="primary-btn"
             onClick={handleInstallApk}
-            disabled={!apkPath.trim() || loading}
-            style={{ width: "auto", padding: "8px 16px", fontSize: 12 }}
+            disabled={!apkPath.trim() || installing}
+            style={{
+              width: "auto",
+              padding: "8px 16px",
+              fontSize: 12,
+              display: "inline-flex",
+              alignItems: "center",
+            }}
           >
-            📦 Sideload APK
+            {installing ? (
+              <>
+                <span className="btn-spinner" aria-hidden />
+                Installing…
+              </>
+            ) : (
+              "📦 Sideload APK"
+            )}
           </button>
         </div>
 

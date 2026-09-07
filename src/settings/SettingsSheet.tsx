@@ -101,6 +101,7 @@ export function SettingsSheet({
             >
               <option value="builtin">Built-in Network tab</option>
               <option value="charles">Charles (keep remote + Charles)</option>
+              <option value="reset">Reset TV proxy</option>
               <option value="off">Don’t change TV proxy</option>
             </select>
           </div>
@@ -128,7 +129,7 @@ export function SettingsSheet({
               />
             </div>
           </div>
-        ) : settings.deviceProxyMode !== "off" ? (
+        ) : settings.deviceProxyMode === "builtin" ? (
           <div className="row" style={{ gap: 12, marginTop: 8 }}>
             <div style={{ flex: 1 }}>
               <label className="hint">Inspect Proxy Port</label>

@@ -120,7 +120,7 @@ export type Settings = {
   bitRate: number;
   maxFps: number;
   audioEnabled: boolean;
-  deviceProxyMode?: "builtin" | "charles" | "off";
+  deviceProxyMode?: "builtin" | "charles" | "off" | "reset";
   charlesHost?: string;
   charlesPort?: number;
 };

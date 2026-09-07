@@ -312,6 +312,12 @@ async fn forget_device(
         let serial = state.connected.lock().await.take().map(|d| d.serial);
         teardown_session(&state, serial.as_deref()).await;
         emit_status(&app, &state).await;
+    } else {
+        // Lock Port 5555 keeps wireless ADB attached after in-app disconnect,
+        // so we can still wipe a leftover inspect/Charles proxy.
+        let adb = state.adb.lock().await.clone();
+        clear_device_proxy(&adb, &serial).await;
+        remove_proxy_reverse(&adb, &serial, &state).await;
     }
     state.registry.lock().await.forget(&serial)?;
     Ok(())
@@ -553,10 +559,20 @@ async fn start_recording(app: AppHandle, state: State<'_, Arc<AppState>>) -> Res
     ));
     let sps = state.scrcpy.sps_snapshot().await;
     let pps = state.scrcpy.pps_snapshot().await;
+    if sps.is_empty() || pps.is_empty() {
+        return Err(AppError::from(
+            "video stream not ready; wait for the picture then try again",
+        ));
+    }
     state
         .scrcpy
         .recorder
         .start(&path, status.width, status.height, sps, pps)?;
+    // Rec starts mid-GOP. Static TV screens may not emit another IDR, so
+    // seed the file with the last keyframe or every later P-frame is dropped.
+    if let Some(keyframe) = state.scrcpy.keyframe_snapshot().await {
+        let _ = state.scrcpy.recorder.push_sample(&keyframe, true);
+    }
     let path_s = path.to_string_lossy().to_string();
     emit_recording_status(&app, &state).await;
     Ok(path_s)
@@ -1225,23 +1241,36 @@ async fn teardown_session(state: &AppState, serial: Option<&str>) {
 }
 
 async fn clear_device_proxy(adb: &AdbClient, serial: &str) {
-    let _ = adb.shell(serial, "settings delete global http_proxy").await;
-    let _ = adb
-        .shell(serial, "settings delete global global_http_proxy_host")
-        .await;
-    let _ = adb
-        .shell(serial, "settings delete global global_http_proxy_port")
-        .await;
+    // `settings delete` alone does not disable the proxy on some Android TV
+    // builds (HP/Intigral, Hisense): ConnectivityService keeps routing through
+    // the last host:port. `:0` is the documented "no proxy" value.
+    for cmd in [
+        "settings delete global http_proxy",
+        "settings delete global global_http_proxy_host",
+        "settings delete global global_http_proxy_port",
+        "settings delete global global_http_proxy_exclusion_list",
+        "settings delete global global_proxy_pac_url",
+        "settings put global http_proxy :0",
+    ] {
+        let _ = adb.shell(serial, cmd).await;
+    }
 }
 
 async fn attach_inspect_proxy(adb: &AdbClient, serial: &str, state: &AppState) {
     let settings = state.settings.lock().await.clone();
-    // Always wipe leftover Charles / inspect keys first. The TV Settings UI
+    match settings.device_proxy_mode.as_str() {
+        "off" => return,
+        "reset" => {
+            clear_device_proxy(adb, serial).await;
+            return;
+        }
+        _ => {}
+    }
+    // Wipe leftover Charles / inspect keys first. The TV Settings UI
     // shows global_http_proxy_host:port; built-in used to only overwrite
     // http_proxy, so the screen still said "Charles".
     clear_device_proxy(adb, serial).await;
     match settings.device_proxy_mode.as_str() {
-        "off" => {}
         "charles" => {
             let host = match sanitize::validate_host(settings.charles_host.trim()) {
                 Ok(h) => h,
